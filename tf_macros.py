@@ -1,5 +1,4 @@
 from itertools import chain, combinations
-from math import sqrt
 import tensorflow as tf
 
 
@@ -20,153 +19,218 @@ def product(xs):
     return prod
 
 
-def make_least_common_shape(xs):
-    common_rank = rank(xs[0])
-    assert all(rank(x) == common_rank for x in xs)
+def make_least_common_shape(*xs, ignore_ranks=()):
+    assert len(xs) > 0
+    if len(xs) == 1 and not isinstance(xs[0], tf.Tensor):
+        xs = xs[0]
     shapes = [shape(x) for x in xs]
-    least_common_shape = tuple(max(s[r] for s in shapes) for r in range(common_rank))
+    common_rank = len(shapes[0])
+    assert all(len(s) == common_rank for s in shapes)
+    ref_shape = tuple(max(s[r] for s in shapes) for r in range(common_rank))
     ys = list()
     for x, s in zip(xs, shapes):
-        if all(s[r] == least_common_shape[r] for r in range(common_rank)):
-            continue
-        x = tf.tile(input=x, multiples=[common_dims if dims == 1 else 1 for dims, common_dims in zip(s, least_common_shape)])
-        assert shape(x) == least_common_shape
+        multiples = [ref_dims if dims == 1 and r not in ignore_ranks else 1 for r, (dims, ref_dims) in enumerate(zip(s, ref_shape))]
+        if not all(m == 1 for m in multiples):
+            x = tf.tile(input=x, multiples=multiples)
+        assert rank(x) == common_rank and all(d1 == d2 for r, (d1, d2) in enumerate(zip(shape(x), ref_shape)) if r not in ignore_ranks)
         ys.append(x)
     return ys
 
 
-def make_broadcastable(xs):
-    broadcastable_shape = shape(max(xs, key=lambda x: rank(x) - 0.5 * sum(dims == 1 for dims in shape(x))))
+def make_broadcastable(*xs):
+    assert len(xs) > 0
+    if len(xs) == 1 and not isinstance(xs[0], tf.Tensor):
+        xs = xs[0]
+    shapes = [shape(x) for x in xs]
+    ref_shape = max(shapes, key=(lambda s: len(s) - sum(dims == 1 for dims in s) / (len(s) + 1)))
     ys = list()
-    for x in xs:
-        x_shape = shape(x)
-        if len(x_shape) == len(broadcastable_shape):
-            assert all(dims == ref_dims or dims == 1 for dims, ref_dims in zip(x_shape, broadcastable_shape))
-            ys.append(x)
-            continue
-        r = len(x_shape) - 1
-        last_dims = None
-        for dims in reversed(broadcastable_shape):
-            if r >= 0 and x_shape[r] == dims:
-                r -= 1
-                last_dims = dims
-            else:
-                print(x_shape, broadcastable_shape)
-                assert dims != last_dims
-                x = tf.expand_dims(input=x, axis=(r + 1))
-        assert r == -1
+    for x, s in zip(xs, shapes):
+        s = list(s)
+        if len(s) < len(ref_shape):
+            last_dims = None
+            for r, (dims, ref_dims) in enumerate(zip(s, ref_shape)):
+                if r < len(s) and dims in (ref_dims, 1):
+                    last_dims = dims
+                else:
+                    assert dims != last_dims
+                    x = tf.expand_dims(input=x, axis=r)
+                    s.insert(r, 1)
+        assert rank(x) == len(ref_shape) and all(d1 == d2 or d1 == 1 for d1, d2 in zip(shape(x), ref_shape))
         ys.append(x)
     return ys
 
 
 class Model(object):
 
+    precision = 32
     current = None
 
-    precision = 32
-    tensors = dict()
-    variables = dict()
-    placeholders = dict()
-    variable_keys = []
-
     @staticmethod
-    def dtype(dtype):
+    def dtype(dtype, include_bytes=False):
+        assert Model.precision % 8 == 0
         assert dtype in ('float', 'int')
-        return dtype + str(Model.precision)
+        if dtype == 'float':
+            if Model.precision == 32:
+                dtype = tf.float32
+            else:
+                assert False
+        elif dtype == 'int':
+            if Model.precision == 32:
+                dtype = tf.int32
+            else:
+                assert False
+        else:
+            assert False
+        if include_bytes:
+            return dtype, Model.precision // 8
+        else:
+            return dtype
 
     @staticmethod
-    def add_tensor(name, tensor):
-        assert name not in Model.tensors
-        Model.tensors[name] = tensor
+    def register_tensor(key, tensor):
+        assert key not in ('loss', 'dropout')
+        assert key not in Model.current.tensors
+        Model.current.tensors[key] = tensor
 
-    def __init__(self, optimizer='adam', learning_rate=0.001, name=None, model_file=None):
+    @staticmethod
+    def register_variable(key, variable, num_parameters, num_bytes):
+        if key in Model.current.variables:
+            assert variable == Model.current.variables[key]
+        else:
+            Model.current.variables[key] = variable
+            Model.current.num_parameters += num_parameters
+            Model.current.num_bytes += num_bytes
+
+    @staticmethod
+    def register_placeholder(key, placeholder):
+        assert key not in Model.current.placeholders
+        Model.current.placeholders[key] = placeholder
+
+    def __init__(self, name=None, optimizer='adam', learning_rate=0.0001, weight_decay=0.0001, clip_gradients=10.0, model_file=None, summary_file=None):
+        assert name is None or isinstance(name, str)
         assert optimizer in ('adam',)
         assert isinstance(learning_rate, float)
-        assert name is None or isinstance(name, str)
+        assert isinstance(weight_decay, float)
+        assert isinstance(clip_gradients, float)
         assert model_file is None or isinstance(model_file, str)
-        self.model_file = model_file
+        assert summary_file is None or isinstance(summary_file, str)
+        self.name = name
         self.optimizer = optimizer
         self.learning_rate = learning_rate
-        self.name = name
+        self.weight_decay = weight_decay
+        self.clip_gradients = clip_gradients
+        self.model_file = model_file
+        self.summary_file = summary_file
+        self.tensors = dict()
+        self.variables = dict()
+        self.placeholders = dict()
+        self.num_parameters = 0
+        self.num_bytes = 0
         self.session = None
         self.defined = False
 
     def __str__(self):
-        return 'Model({})'.format(self.name)
+        if self.name is None:
+            return 'Model'
+        else:
+            return self.name
 
     def __enter__(self):
         assert Model.current is None
         Model.current = self
-        self.scope = tf.name_scope(self.name)
+        self.scope = tf.variable_scope(str(self))
         self.scope.__enter__()
         Input(name='dropout', shape=(), batched=False).forward()
-        self.dropout = Model.placeholders.pop('dropout')
+        self.dropout = self.placeholders.pop('dropout')
         return self
 
     def __exit__(self, type, value, tb):
         if type is not None:
             assert False
-        assert Model.current is not None
-        Model.current = None
         if self.defined:
             self.coordinator.request_stop()
             self.coordinator.join(threads=self.queue_threads)
             if self.model_file:
                 self.saver.save(sess=self.session, save_path=self.model_file)
         else:
+            for name, variable in self.variables.items():
+                regularization = self.weight_decay * tf.nn.l2_loss(t=variable, name=(name + '-regularization'))
+                tf.losses.add_loss(loss=regularization, loss_collection=tf.GraphKeys.REGULARIZATION_LOSSES)
+            loss = tf.losses.get_total_loss()
+            self.tensors['loss'] = loss
             if self.optimizer == 'adam':
                 optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
-            loss = tf.losses.get_total_loss()
-            Model.add_tensor(name='loss', tensor=loss)
             grads_and_vars = optimizer.compute_gradients(loss=loss)
+            grads_and_vars = [(tf.clip_by_value(t=grad, clip_value_min=-self.clip_gradients, clip_value_max=self.clip_gradients), var) for grad, var in grads_and_vars]
             self.optimization = optimizer.apply_gradients(grads_and_vars=grads_and_vars)
             self.scope.__exit__(type, value, tb)
+            assert False
+        assert Model.current is not None
+        Model.current = None
 
     def finalize(self, restore=False):
+        for name, variable in self.variables.items():
+            regularization = self.weight_decay * tf.nn.l2_loss(t=variable, name=(name + '-regularization'))
+            tf.losses.add_loss(loss=regularization, loss_collection=tf.GraphKeys.REGULARIZATION_LOSSES)
+        loss = tf.losses.get_total_loss()
+        self.tensors['loss'] = loss
         if self.optimizer == 'adam':
             optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
-        loss = tf.losses.get_total_loss()
-        Model.add_tensor(name='loss', tensor=loss)
         grads_and_vars = optimizer.compute_gradients(loss=loss)
+        grads_and_vars = [(tf.clip_by_value(t=grad, clip_value_min=-self.clip_gradients, clip_value_max=self.clip_gradients), var) for grad, var in grads_and_vars]
         self.optimization = optimizer.apply_gradients(grads_and_vars=grads_and_vars)
+        global_variables_initializer = tf.global_variables_initializer()
+        if self.summary_file is not None:
+            tf.summary.scalar(name='loss', tensor=loss)
+            for variable in tf.trainable_variables():
+                tf.summary.histogram(name=variable.name, values=variable)
+            self.summaries = tf.summary.merge_all()
         self.scope.__exit__(None, None, None)
+        tf.get_default_graph().finalize()
         self.defined = True
 
         self.session = tf.Session()
-        if self.model_file:
+        if self.model_file is not None:
             self.saver = tf.train.Saver()
         if restore:
             assert self.model_file
             self.saver.restore(sess=self.session, save_path=self.model_file)
         else:
-            self.session.run(tf.global_variables_initializer())
+            self.session.run(fetches=global_variables_initializer)
+        if self.summary_file is not None:
+            self.summary_writer = tf.summary.FileWriter(logdir=self.summary_file, graph=self.session.graph)
         self.coordinator = tf.train.Coordinator()
         self.queue_threads = tf.train.start_queue_runners(sess=self.session, coord=self.coordinator)
 
-    def __call__(self, query=None, data=None, optimize=True, dropout=0.0):
+    def __call__(self, query=None, data=None, optimize=True, summarize=True, dropout=0.0):
         assert self.session
         if query is None:
             fetches = dict()
         elif isinstance(query, str):
-            fetches = dict(query=Model.tensors[query])
+            fetches = dict(query=self.tensors[query])
         else:
-            fetches = {name: Model.tensors[name] for name in query}
+            fetches = {name: self.tensors[name] for name in query}
         if optimize:
             assert 'optimization' not in fetches
             fetches['optimization'] = self.optimization
+        if self.summary_file is not None and summarize:
+            assert 'summaries' not in fetches
+            fetches['summaries'] = self.summaries
         if data is None:
             feed_dict = None
         elif isinstance(data, dict):
-            feed_dict = {Model.placeholders[value]: data[value] for value in Model.placeholders}
+            feed_dict = {self.placeholders[name]: value for name, value in data.items() if name in self.placeholders}
         else:
-            assert len(Model.placeholders) == 1
-            feed_dict = {next(iter(Model.placeholders.values())): data}
+            assert len(self.placeholders) == 1
+            feed_dict = {next(iter(self.placeholders.values())): data}
         if dropout > 0.0:
             assert dropout < 1.0
             feed_dict[self.dropout] = dropout
         fetched = self.session.run(fetches=fetches, feed_dict=feed_dict)
         if optimize:
             fetched.pop('optimization')
+        if self.summary_file is not None and summarize:
+            fetched.pop('summaries')
         return fetched
 
 
@@ -175,71 +239,69 @@ class Unit(object):
     num_in = -1
     num_out = -1
 
-    def __init__(self, name=None, variable_key=None):
-        name = name if name is None or isinstance(name, str) else tuple(name)
-        assert name is None or isinstance(name, str) or isinstance(name, tuple)
-        assert variable_key is None or isinstance(variable_key, str)
+    _index = 0
+
+    def __init__(self, name=None):
+        assert name is None or isinstance(name, str)
+        if name is None:
+            name = self.__class__.__name__ + str(self.__class__._index)
+            self.__class__._index += 1
         self.name = name
-        self.variable_key = variable_key
-        self.output = None
-
-    def __str__(self):
-        return self.__class__.__name__
-
-    def subkey(self, key):
-        return key if self.variable_key else None
+        self.outputs = dict()
+        self._forward = tf.make_template(name_=str(self), func_=self.forward)
 
     def forward(self, *inputs):
         raise NotImplementedError
 
-    def __call__(self, *inputs):
-        if self.output is None:
-            with tf.name_scope(str(self)):
-                if self.variable_key:
-                    Model.variable_keys.append(self.variable_key)
-                output = self.forward(*inputs)
-                if isinstance(output, tf.Tensor):
-                    self.output = output
-                    if self.name is not None:
-                        assert isinstance(self.name, str)
-                        Model.add_tensor(name=self.name, tensor=self.output)
-                elif len(output) == 1:
-                    self.output = output[0]
-                    if self.name is not None:
-                        assert isinstance(self.name, str)
-                        Model.add_tensor(name=self.name, tensor=self.output)
-                else:
-                    self.output = tuple(output)
-                    if self.name is not None:
-                        assert isinstance(self.name, tuple)
-                        for name, output in zip(self.name, self.output):
-                            Model.add_tensor(name=name, tensor=output)
-                if self.variable_key:
-                    Model.variable_keys.pop()
-        return self.output
+    def __str__(self):
+        return self.name
+
+    def __call__(self, *inputs, output_key=None):
+        assert output_key is None or isinstance(output_key, str)
+        if output_key is not None and output_key in self.outputs:
+            return self.outputs[output_key]
+        output = self._forward(*inputs)
+        if isinstance(output, tf.Tensor):
+            if output_key is not None:
+                self.outputs[output_key] = output
+                Model.register_tensor(key=output_key, tensor=output)
+        elif len(output) == 1:
+            output = output[0]
+            if output_key is not None:
+                self.outputs[output_key] = output
+                Model.register_tensor(key=output_key, tensor=output)
+        else:
+            output = tuple(output)
+            if output_key is not None:
+                self.outputs[output_key] = output
+                for n, tensor in enumerate(output):
+                    Model.register_tensor(key=(output_key + str(n)), tensor=tensor)
+        return output
 
     def __rshift__(self, other):
         assert isinstance(other, Unit)
-        inputs = self()
-        inputs = (inputs,) if isinstance(inputs, tf.Tensor) else inputs
-        return other(*inputs)
+        if self.__class__.num_in == 0:
+            inputs = self()
+            inputs = (inputs,) if isinstance(inputs, tf.Tensor) else inputs
+            return other(*inputs)
+        else:
+            return Composed(first=self, second=other)
 
     def __rrshift__(self, other):
         composed = False
         if isinstance(other, tf.Tensor):
-            inputs = (other,)
-        else:
-            inputs = []
-            for x in other:
-                if isinstance(x, tf.Tensor):
-                    inputs.append(x)
-                elif isinstance(x, Composed):
-                    inputs.append(x)
-                    composed = True
-                else:
-                    x = x()
-                    assert isinstance(x, tf.Tensor)
-                    inputs.append(x)
+            return self(other)
+        inputs = []
+        for x in other:
+            if isinstance(x, tf.Tensor):
+                inputs.append(x)
+            elif isinstance(x, Composed):
+                inputs.append(x)
+                composed = True
+            else:
+                x = x()
+                assert isinstance(x, tf.Tensor)
+                inputs.append(x)
         if composed:
             return Composed(first=inputs, second=self)
         else:
@@ -249,16 +311,20 @@ class Unit(object):
 class Composed(Unit):
 
     def __init__(self, first, second):
-        super(Composed, self).__init__()
         self.first = first
         self.second = second
+        super(Composed, self).__init__()
 
     def forward(self, *xs):
-        return xs >> self.first >> self.second
+        assert isinstance(self.first, Unit) or len(xs) == 1
+        if len(xs) == 1:
+            return xs[0] >> self.first >> self.second
+        else:
+            return xs >> self.first >> self.second
 
     def __rshift__(self, other):
         assert isinstance(other, Unit)
-        return Composed(first=(self,), second=other)
+        return Composed(first=self, second=other)
 
 
 class Layer(Unit):
@@ -266,23 +332,23 @@ class Layer(Unit):
     num_in = 1
     num_out = 1
 
-    def __init__(self, size, name=None, variable_key=None):
+    def __init__(self, size, name=None):
         assert self.__class__.num_in == 1 and self.__class__.num_out == 1
-        super(Layer, self).__init__(variable_key=variable_key)
         assert isinstance(size, int) and size > 0
         self.size = size
+        super(Layer, self).__init__(name=name)
 
 
 class LayerStack(Unit):
 
-    def __init__(self, name=None, variable_key=None):
-        super(LayerStack, self).__init__(variable_key=variable_key)
-        self.layers = []
+    def __init__(self, name=None):
+        assert hasattr(self, 'layers')
+        super(LayerStack, self).__init__(name=name)
 
-    def forward(self, x):
+    def forward(self, *xs):
         for layer in self.layers:
-            x >>= layer
-        return x
+            xs >>= layer
+        return xs
 
 
 class Variable(Unit):
@@ -290,49 +356,49 @@ class Variable(Unit):
     num_in = 0
     num_out = 1
 
-    def __init__(self, key, shape, dtype='float', init='out', value=None, name=None):
+    def __init__(self, name, shape=None, dtype='float', init='out', value=None):
         assert self.__class__.num_in == 0 and self.__class__.num_out == 1
-        super(Variable, self).__init__(name=name, variable_key=key)
-        shape = (shape,) if isinstance(shape, int) else tuple(shape)
-        assert len(shape) > 0 and all(isinstance(n, int) and n > 0 for n in shape)
-        assert init in ('constant', 'zeros', 'ones', 'in', 'out', 'in-out', 'stddev') or Nonlinearity.valid(init)
+        assert isinstance(name, str)
+        if shape is not None:
+            shape = (shape,) if isinstance(shape, int) else tuple(shape)
+            assert len(shape) > 0 and all(isinstance(n, int) and n > 0 for n in shape)
+        assert init in ('constant', 'zeros', 'ones', 'in', 'out', 'in-out', 'stddev') or Activation.valid(init)
         assert init in ('constant', 'zeros', 'ones') or dtype == 'float'
         self.shape = shape
-        self.dtype = Model.dtype(dtype=dtype)
+        self.dtype, self.dtype_bytes = Model.dtype(dtype=dtype, include_bytes=True)
         self.init = init
         self.value = value
+        super(Variable, self).__init__(name=name)
+
+    def specify_shape(self, shape):
+        assert self.shape is None
+        self.shape = shape
 
     def forward(self):
-        if self.init == 'constant':
-            assert self.value is not None
-            initializer = self.value
-        elif self.init == 'zeros':
-            initializer = tf.zeros(shape=self.shape, dtype=self.dtype)
+        assert self.shape is not None
+        if self.init == 'zeros':
+            initializer = tf.zeros_initializer(dtype=self.dtype)
         elif self.init == 'ones':
-            initializer = tf.ones(shape=self.shape, dtype=self.dtype)
+            initializer = tf.ones_initializer(dtype=self.dtype)
+        elif self.init == 'stddev':
+            assert self.value is not None
+            initializer = tf.random_normal_initializer(mean=0.0, stddev=self.value, dtype=tf.float32)
+        elif self.init == 'selu':
+            initializer = tf.contrib.layers.variance_scaling_initializer(factor=1.0, mode='FAN_OUT', dtype=self.dtype)
+        elif self.init == 'out':
+            initializer = tf.contrib.layers.variance_scaling_initializer(factor=2.0, mode='FAN_OUT', dtype=self.dtype)
+        elif self.init == 'in' or self.init in ('elu', 'relu'):
+            assert len(self.shape) >= 2
+            initializer = tf.contrib.layers.variance_scaling_initializer(factor=2.0, mode='FAN_IN', dtype=self.dtype)
+        elif self.init == 'in-out' or Activation.valid(self.init):
+            assert len(self.shape) >= 2
+            initializer = tf.contrib.layers.variance_scaling_initializer(factor=1.0, mode='FAN_AVG', dtype=self.dtype)
         else:
-            if self.init == 'stddev':
-                assert self.value is not None
-                stddev = self.value
-            elif self.init == 'selu':
-                stddev = sqrt(1.0 / self.shape[-1])
-            elif self.init == 'out':
-                stddev = sqrt(2.0 / self.shape[-1])
-            elif self.init == 'in' or self.init in ('elu', 'relu'):
-                assert len(self.shape) >= 2
-                stddev = sqrt(2.0 / self.shape[-2])
-            elif self.init == 'in-out' or Nonlinearity.valid(self.init):
-                assert len(self.shape) >= 2
-                stddev = sqrt(2.0 / (self.shape[-2] + self.shape[-1]))
-            initializer = tf.truncated_normal(shape=self.shape, stddev=stddev)
-        if Model.variable_keys:
-            key = '/'.join(Model.variable_keys) + '/' + self.variable_key
-            if key not in Model.variables:
-                Model.variables[key] = variable = tf.Variable(initial_value=initializer, trainable=(self.init != 'constant'), name=key, dtype=self.dtype)
-            else:
-                variable = Model.variables[key]
-        else:
-            variable = tf.Variable(initial_value=initializer, trainable=(self.init != 'constant'), name=self.variable_key, dtype=self.dtype)
+            assert False
+        variable = tf.get_variable(name=self.name, shape=self.shape, dtype=self.dtype, initializer=initializer)
+        num_parameters = product(self.shape)
+        num_bytes = num_parameters * self.dtype_bytes
+        Model.register_variable(key='{}/{}'.format(tf.get_variable_scope().name, self.name), variable=variable, num_parameters=num_parameters, num_bytes=num_bytes)
         return tf.identity(input=variable)
 
 
@@ -341,9 +407,8 @@ class Input(Unit):
     num_in = 0
     num_out = 1
 
-    def __init__(self, name, shape, dtype='float', batched=True, tensor=None, variable_key=None):
+    def __init__(self, name, shape, dtype='float', batched=True, tensor=None):
         assert isinstance(name, str)
-        super(Input, self).__init__(name=name, variable_key=variable_key)
         shape = (shape,) if isinstance(shape, int) else tuple(shape)
         assert all(isinstance(n, int) and (n > 0 or n == -1) for n in shape)
         assert isinstance(batched, bool)
@@ -352,31 +417,32 @@ class Input(Unit):
         if batched:
             self.shape = (None,) + self.shape
         self.tensor = tensor
+        super(Input, self).__init__(name=name)
 
     def forward(self):
         if self.tensor is None:
-            assert self.name not in Model.placeholders
-            Model.placeholders[self.name] = placeholder = tf.placeholder(dtype=self.dtype, shape=self.shape)
-            return tf.identity(input=placeholder)
-        else:
-            return tf.identity(input=self.tensor)
+            placeholder = tf.placeholder(dtype=self.dtype, shape=self.shape, name=self.name)
+            Model.register_placeholder(key=self.name, placeholder=placeholder)
+            self.tensor = tf.identity(input=placeholder)
+        return self.tensor
 
 
 class Binary(Input):
 
     num_in = 1
 
-    def __init__(self, name, soft=0.0, tensor=None, variable_key=None):
-        super(Binary, self).__init__(name=name, shape=(), batched=True, tensor=tensor, variable_key=variable_key)
+    def __init__(self, name, soft=0.0, tensor=None):
+        assert isinstance(name, str)
         assert isinstance(soft, float) and 0.0 <= soft < 0.5
         self.soft = soft
+        super(Binary, self).__init__(name=name, shape=(), batched=True, tensor=tensor)
 
     def forward(self, x):
         correct = y = super(Binary, self).forward()
         if self.soft > 0.0:
             noise = tf.random_uniform(shape=(1, 1), minval=0.0, maxval=self.soft)
             correct = tf.abs(x=(correct - noise))
-        x >>= Linear(size=1, variable_key=self.subkey('prediction'))
+        x >>= Linear(size=1)
         x = (tf.tanh(x=x) + 1.0) / 2.0
         cross_entropy = -(correct * tf.log(x=x + 1e-10) + (1.0 - correct) * tf.log(x=1.0 - x + 1e-10))
         loss = tf.reduce_mean(input_tensor=cross_entropy)
@@ -384,20 +450,20 @@ class Binary(Input):
         prediction = tf.cast(x=tf.greater(x=x, y=tf.constant(value=0.5)), dtype=Model.dtype('float'))
         correct = tf.cast(x=tf.equal(x=prediction, y=correct), dtype=Model.dtype('float'))
         accuracy = tf.reduce_mean(input_tensor=correct)
-        Model.add_tensor(name=self.name + '-accuracy', tensor=accuracy)
+        Model.register_tensor(key=(self.name + '-accuracy'), tensor=accuracy)
         return y
 
 
 class Classification(Input):
 
-    def __init__(self, name, num_classes, multi_class=False, soft=0.0, tensor=None, variable_key=None):
-        super(Classification, self).__init__(name=name, shape=(num_classes,), batched=True, tensor=tensor, variable_key=variable_key)
+    def __init__(self, name, num_classes, multi_class=False, soft=0.0, tensor=None):
         assert isinstance(num_classes, int) and num_classes > 0
         assert isinstance(multi_class, bool)
         assert isinstance(soft, float) and 0.0 <= soft < 0.5
         self.num_classes = num_classes
         self.multi_class = multi_class
         self.soft = soft
+        super(Classification, self).__init__(name=name, shape=(num_classes,), batched=True, tensor=tensor)
 
     def forward(self, x):
         correct = y = super(Classification, self).forward()
@@ -406,7 +472,7 @@ class Classification(Input):
         if self.soft > 0.0:
             noise = tf.random_uniform(shape=(1, shape(correct)[1]), minval=0.0, maxval=self.soft)
             correct = tf.abs(x=(correct - noise))
-        x >>= Linear(size=self.num_classes, variable_key=self.subkey('prediction'))
+        x >>= Linear(size=self.num_classes)
         if self.multi_class:
             tf.losses.sigmoid_cross_entropy(multi_class_labels=correct, logits=x)
         else:
@@ -417,8 +483,8 @@ class Classification(Input):
         true_positive = tf.reduce_sum(input_tensor=tf.minimum(x=prediction, y=correct), axis=1)
         precision = tf.reduce_mean(input_tensor=tf.divide(x=true_positive, y=selected), axis=0)
         recall = tf.reduce_mean(input_tensor=tf.divide(x=true_positive, y=relevant), axis=0)
-        Model.add_tensor(name=self.name + '-precision', tensor=precision)
-        Model.add_tensor(name=self.name + '-recall', tensor=recall)
+        Model.register_tensor(key=(self.name + '-precision'), tensor=precision)
+        Model.register_tensor(key=(self.name + '-recall'), tensor=recall)
         return y
 
 
@@ -449,11 +515,11 @@ class Identity(Unit):
 class Print(Unit):
 
     def __init__(self, size=10, times=None, name=None):
-        super(Print, self).__init__(name=name)
         assert isinstance(size, int) and size > 0
         assert times is None or isinstance(times, int) and times > 0
         self.size = size
         self.times = times
+        super(Print, self).__init__(name=name)
 
     def forward(self, *xs):
         return (tf.Print(input_=xs[0], data=xs, summarize=self.size, first_n=self.times),) + tuple(xs[1:])
@@ -462,41 +528,41 @@ class Print(Unit):
 class Select(Unit):
 
     def __init__(self, index, name=None):
-        super(Select, self).__init__(name=name)
         assert isinstance(index, int) and index >= 0
         self.index = index
+        super(Select, self).__init__(name=name)
 
     def forward(self, *xs):
         assert len(xs) > self.index
         return xs[self.index]
 
 
-class Nonlinearity(Unit):
+class Activation(Unit):
 
     @staticmethod
-    def valid(nonlinearity):
-        return nonlinearity in ('elu', 'relu', 'sigmoid', 'softmax', 'tanh')
+    def valid(activation):
+        return activation in ('elu', 'relu', 'sigmoid', 'softmax', 'tanh')
 
-    def __init__(self, nonlinearity='relu', name=None):
-        super(Nonlinearity, self).__init__(name=name)
-        assert Nonlinearity.valid(nonlinearity)
-        self.nonlinearity = nonlinearity
+    def __init__(self, activation='relu', name=None):
+        assert Activation.valid(activation)
+        self.activation = activation
+        super(Activation, self).__init__(name=name)
 
     def forward(self, x):
-        if self.nonlinearity == 'elu':
+        if self.activation == 'elu':
             return tf.nn.elu(features=x)
-        elif self.nonlinearity == 'relu':
+        elif self.activation == 'relu':
             return tf.nn.relu(features=x)
-        elif self.nonlinearity == 'selu':
+        elif self.activation == 'selu':
             # https://arxiv.org/pdf/1706.02515.pdf
             alpha = 1.6732632423543772848170429916717
             scale = 1.0507009873554804934193349852946
             return scale * tf.where(condition=(x >= 0.0), x=x, y=(alpha * tf.nn.elu(features=x)))
-        elif self.nonlinearity == 'sigmoid':
+        elif self.activation == 'sigmoid':
             return tf.sigmoid(x=x)
-        elif self.nonlinearity == 'softmax':
+        elif self.activation == 'softmax':
             return tf.nn.softmax(logits=x)
-        elif self.nonlinearity == 'tanh':
+        elif self.activation == 'tanh':
             return tf.nn.tanh(x=x)
 
 
@@ -518,20 +584,38 @@ class Normalization(Unit):
     num_in = 1
     num_out = 1
 
-    def __init__(self, offset=False, scale=False, variance_epsilon=1e-6, name=None, variable_key=None):
-        super(Normalization, self).__init__(name=name, variable_key=variable_key)
-        assert isinstance(offset, bool)
-        assert isinstance(scale, bool)
+    def __init__(self, offset=False, scale=False, variance_epsilon=1e-6, name=None):
+        assert isinstance(offset, bool) or issubclass(offset, Layer)
+        assert isinstance(scale, bool) or issubclass(scale, Layer)
         assert isinstance(variance_epsilon, float) and variance_epsilon > 0.0
         self.offset = offset
         self.scale = scale
         self.variance_epsilon = variance_epsilon
+        super(Normalization, self).__init__(name=name)
 
-    def forward(self, x):
+    def forward(self, x, condition=None):
         mean, variance = tf.nn.moments(x=x, axes=tuple(range(rank(x) - 1)))
-        self.offset = Variable(key=self.subkey('offset'), shape=shape(mean), init='zeros') if self.offset else None
-        self.scale = Variable(key=self.subkey('scale'), shape=shape(mean), init='zeros') if self.scale else None
-        return tf.nn.batch_normalization(x=x, mean=mean, variance=variance, offset=(self.offset() if self.offset else None), scale=(self.scale() if self.scale else None), variance_epsilon=self.variance_epsilon)
+        if condition is None:
+            if self.offset:
+                self.offset = Variable(name='offset', shape=shape(mean), init='zeros')
+                offset = self.offset()
+            else:
+                self.offset = offset = None
+            if self.scale:
+                self.scale = Variable(name='scale', shape=shape(mean), init='zeros')
+                scale = 1.0 + self.scale()
+            else:
+                self.scale = scale = None
+        else:
+            assert issubclass(self.offset, Layer) and issubclass(self.scale, Layer)
+            size = shape(mean)[0]
+            self.offset = self.offset(size=size)
+            offset = condition >> self.offset
+            offset = tf.expand_dims(input=tf.expand_dims(input=offset, axis=1), axis=1)
+            self.scale = self.scale(size=size)
+            scale = 1.0 + (condition >> self.scale)
+            scale = tf.expand_dims(input=tf.expand_dims(input=scale, axis=1), axis=1)
+        return tf.nn.batch_normalization(x=x, mean=mean, variance=variance, offset=offset, scale=scale, variance_epsilon=self.variance_epsilon)
 
 
 class Reduction(Unit):
@@ -539,110 +623,128 @@ class Reduction(Unit):
     num_in = -1
     num_out = 1
 
-    requires_uniform_shape = ('collapse', 'conv', 'max', 'mean', 'prod', 'sum')
-
     @staticmethod
     def valid(reduction):
-        return isinstance(reduction, str) and reduction in ('cbp', 'collapse', 'concat', 'conv', 'conv2d', 'last', 'max', 'mean', 'prod', 'stack', 'sum')
+        return isinstance(reduction, str) and reduction in ('cbp', 'collapse', 'concat', 'conv', 'conv2d', 'last', 'max', 'mean', 'min', 'prod', 'stack', 'sum')
 
-    def __init__(self, reduction='avg', axis=-1, arg=None, name=None, variable_key=None):
-        super(Reduction, self).__init__(name=name, variable_key=variable_key)
-        axis = (axis, axis) if isinstance(axis, int) else tuple(axis)
+    def __init__(self, reduction, axis=-1, arg=None, name=None):
         assert Reduction.valid(reduction)
-        assert len(axis) == 2 and isinstance(axis[0], int) and isinstance(axis[1], int)
+        if isinstance(axis, int):
+            axis = (axis,)
+        elif len(axis) == 3 and axis[1] is Ellipsis:
+            assert isinstance(axis[0], int) and isinstance(axis[2], int)
+            axis = tuple(axis)
+        else:
+            assert len(axis) > 0 and all(isinstance(a, int) for a in axis)
+            axis = tuple(sorted(axis))
+        assert len(set(axis)) == len(axis)
+        assert arg is None or reduction in ('concat', 'stack')
         self.reduction = reduction
         self.axis = axis
-        if self.reduction == 'cbp':
-            if arg is None:
-                self.reduction_layer = CompactBilinearPooling(variable_key=self.subkey('cbp'))
-            else:
-                self.reduction_layer = CompactBilinearPooling(size=arg, variable_key=self.subkey('cbp'))
-        elif self.reduction == 'conv':
-            self.reduction_layer = Convolution(size=1, window=1, normalization=False, nonlinearity='relu', variable_key=self.subkey('convolution'))
-        elif self.reduction == 'concat':
-            if arg is None:
-                self.reduction_layer = Concatenation()
-            else:
-                self.reduction_layer = Concatenation(axis=arg)
-        elif self.reduction == 'stack':
-            if arg is None:
-                self.reduction_layer = Stack()
-            else:
-                self.reduction_layer = Stack(axis=arg)
-        else:
-            assert arg is None
-            self.reduction_layer = None
+        self.arg = arg
+        self.multiple_inputs = None
+        if reduction in ('conv', 'conv2d'):
+            self.weights = Variable(name='weights', init='in-out')
+        super(Reduction, self).__init__(name=name)
 
     def forward(self, *xs):
-        multiple_inputs = len(xs) > 1
-        if multiple_inputs:
-            assert self.axis[0] == self.axis[1]
-            # xs = [x if shape(x) == shape(xs[0]) else tf.expand_dims(input=x, axis=self.axis[0]) for x in xs]
-            xs = make_broadcastable(xs)
+        assert len(xs) > 0
+        if self.multiple_inputs is None:
+            self.multiple_inputs = len(xs) > 1
+
+        if self.multiple_inputs:
+            assert self.axis == (-1,)
             assert all(rank(x) == rank(xs[0]) for x in xs)
             axis = self.axis[0] if self.axis[0] >= 0 else rank(xs[0]) + self.axis[0] + 1
+
             if self.reduction == 'max':
                 y = xs[0]
                 for x in xs[1:]:
                     y = tf.maximum(x=y, y=x)
                 return y
+
             elif self.reduction == 'mean':
                 y = xs[0]
                 for x in xs[1:]:
                     y = tf.add(x=y, y=x)
                 return y / float(len(xs))
+
             elif self.reduction == 'min':
                 y = xs[0]
                 for x in xs[1:]:
                     y = tf.minimum(x=y, y=x)
                 return y
+
             elif self.reduction == 'prod':
                 y = xs[0]
                 for x in xs[1:]:
                     y = tf.multiply(x=y, y=x)
                 return y
+
             elif self.reduction == 'sum':
                 y = xs[0]
                 for x in xs[1:]:
                     y = tf.add(x=y, y=x)
                 return y
-            elif self.reduction in Reduction.requires_uniform_shape:
+
+            elif self.reduction in ('collapse', 'conv', 'conv2d'):
                 xs = make_least_common_shape(xs)
                 x = tf.stack(values=xs, axis=axis)
-            else:
-                x = xs[0]
+
         else:
             x = xs[0]
-        start = self.axis[0] if self.axis[0] >= 0 else rank(x) + self.axis[0]
-        end = self.axis[1] + 1 if self.axis[1] >= 0 else rank(x) + self.axis[1] + 1
-        assert rank(x) > max(start, end - 1)
-        if start >= end:
-            return x
-        elif self.reduction == 'collapse':
-            reduced_shape = shape(x)
-            reduced_shape = reduced_shape[:start] + (product(reduced_shape[start:end]),) + reduced_shape[end:]
-            return tf.reshape(tensor=x, shape=reduced_shape)
-        elif self.reduction == 'conv':
-            if multiple_inputs:
-                assert start + 1 == end == rank(x)
+
+            if len(self.axis) == 3 and self.axis[1] is Ellipsis:
+                start, _, end = self.axis
+                start = start if start >= 0 else rank(x) + start
+                end = end if end >= 0 else rank(x) + end
+                self.axis = tuple(range(start, end + 1))
+            elif any(a < 0 for a in self.axis):
+                self.axis = tuple(sorted(a if a >= 0 else rank(x) + a for a in self.axis))
+                assert len(set(self.axis)) == len(self.axis)
+            assert self.axis[0] >= 0 and self.axis[-1] < rank(x)
+
+            if self.reduction in ('concat', 'stack'):
+                for axis in reversed(self.axis):
+                    xs = [y for x in xs for y in tf.unstack(value=x, axis=axis)]
+
+        if self.reduction in ('concat', 'stack'):
+            if self.arg is None:
+                self.arg = rank(xs[0]) - 1
             else:
-                assert start == 1
-                assert end == rank(x) - 1
-                reduced_shape = shape(x)
-                reduced_shape = reduced_shape[:start] + (product(reduced_shape[start:end]),) + reduced_shape[end:]
-                x = tf.transpose(a=tf.reshape(tensor=x, shape=reduced_shape), perm=(0, 2, 1))
-            x >>= self.reduction_layer
+                self.arg = self.arg if self.arg >= 0 else rank(xs[0]) + self.arg
+                assert 0 <= self.arg < rank(xs[0])
+            xs = make_least_common_shape(xs, ignore_ranks=(self.arg,))
+
+        if self.reduction == 'collapse':
+            assert all(axis == n for n, axis in enumerate(self.axis, self.axis[0]))
+            reduced_shape = shape(x)
+            reduced_shape = reduced_shape[:self.axis[0]] + (product(reduced_shape[self.axis[0]:self.axis[-1]]),) + reduced_shape[self.axis[-1]:]
+            return tf.reshape(tensor=x, shape=reduced_shape)
+
+        elif self.reduction == 'concat':
+            return tf.concat(values=xs, axis=self.arg)
+
+        elif self.reduction == 'conv':
+            assert self.axis == (-1,) or (len(self.axis) == rank(x) - 2 and all(axis == n for n, axis in enumerate(self.axis, 1)))
+            reduced_shape = shape(x)
+            reduced_shape = (reduced_shape[:1], product(reduced_shape[1:-1]), reduced_shape[-1:])
+            x = tf.transpose(a=tf.reshape(tensor=x, shape=reduced_shape), perm=(0, 2, 1))
+            self.weights.specify_shape(shape=(1, shape(x)[-1], 1))
+            x = tf.nn.conv1d(value=x, filters=self.weights(), stride=1, padding='SAME')
             return tf.squeeze(input=x, axis=2)
+
         elif self.reduction == 'conv2d':
-            assert start == 1 and end == 3
-            self.reduction_layer = Convolution(size=shape(x)[-1], window=(shape(x)[1], shape(x)[2]), normalization=False, nonlinearity='relu', padding='VALID', variable_key=self.subkey('convolution'))
-            x >>= self.reduction_layer
+            assert self.axis == (-1,) or self.axis == (1, 2)
+            self.weights.specify_shape(shape=(shape(x)[1], shape(x)[2], shape(x)[-1], shape(x)[-1]))
+            x = tf.nn.conv2d(input=x, filter=self.weights(), strides=(1, 1, 1, 1), padding='VALID')
             return tf.squeeze(input=tf.squeeze(input=x, axis=2), axis=1)
+
         elif self.reduction == 'last':
-            if multiple_inputs:
+            if self.multiple_inputs:
                 return xs[-1]
             else:
-                for axis in reversed(range(start, end)):
+                for axis in reversed(self.axis):
                     if axis == 0:
                         x = x[-1, ...]
                     elif axis == 1:
@@ -656,38 +758,32 @@ class Reduction(Unit):
                     else:
                         assert False
                 return x
-        elif self.reduction == 'max':  # many axes at once?
-            for axis in reversed(range(start, end)):
-                x = tf.reduce_max(input_tensor=x, axis=axis)
-            return x
+
+        elif self.reduction == 'max':
+            return tf.reduce_max(input_tensor=x, axis=self.axis)
+
         elif self.reduction == 'mean':
-            for axis in reversed(range(start, end)):
-                x = tf.reduce_mean(input_tensor=x, axis=axis)
-            return x
+            return tf.reduce_mean(input_tensor=x, axis=self.axis)
+
+        elif self.reduction == 'min':
+            return tf.reduce_min(input_tensor=x, axis=self.axis)
+
         elif self.reduction == 'prod':
-            for axis in reversed(range(start, end)):
-                x = tf.reduce_prod(input_tensor=x, axis=axis)
-            return x
+            return tf.reduce_prod(input_tensor=x, axis=self.axis)
+
+        elif self.reduction == 'stack':
+            return tf.stack(values=xs, axis=self.arg)
+
         elif self.reduction == 'sum':
-            for axis in reversed(range(start, end)):
-                x = tf.reduce_sum(input_tensor=x, axis=axis)
-            return x
-        else:
-            assert self.reduction_layer
-            # more general since accepts different shapes !!!
-            if not multiple_inputs:
-                xs = [x]
-                for axis in reversed(range(start, end)):
-                    xs = [y for x in xs for y in tf.unstack(value=x, axis=axis)]
-            return xs >> self.reduction_layer
+            return tf.reduce_sum(input_tensor=x, axis=self.axis)
 
 
 class Concatenation(Unit):
 
     def __init__(self, axis=-1, name=None):
-        super(Concatenation, self).__init__(name=name)
         assert isinstance(axis, int)
         self.axis = axis
+        super(Concatenation, self).__init__(name=name)
 
     def forward(self, *xs):
         assert len(xs) >= 1 and all(rank(x) == rank(xs[0]) for x in xs)  # what if length 0?
@@ -699,9 +795,9 @@ class Concatenation(Unit):
 class Stack(Unit):
 
     def __init__(self, axis=-1, name=None):
-        super(Stack, self).__init__(name=name)
         assert isinstance(axis, int)
         self.axis = axis
+        super(Stack, self).__init__(name=name)
 
     def forward(self, *xs):
         assert len(xs) >= 1 and all(rank(x) == rank(xs[0]) for x in xs)
@@ -710,14 +806,33 @@ class Stack(Unit):
         return tf.stack(values=xs, axis=axis)
 
 
+class Attention(Unit):
+
+    def __init__(self, assessment, name=None):
+        assert isinstance(assessment, Unit)
+        self.assessment = assessment
+        self.softmax = Activation(activation='softmax')
+        self.reduction = Reduction(reduction='sum', axis=(1, ..., -2))
+        super(Attention, self).__init__(name=name)
+
+    def forward(self, x, query):
+        assert rank(x) > 2 and rank(query) == 2 and shape(query)[0] == shape(x)[0]
+        for _ in range(rank(x) - 2):
+            query = tf.expand_dims(input=query, axis=1)
+        attention = (x, query) >> self.assessment >> self.softmax
+        assert shape(attention) == shape(x)[:-1]
+        attention = tf.expand_dims(input=attention, axis=(rank(x) - 1))
+        return (x * attention) >> self.reduction
+
+
 class CompactBilinearPooling(Unit):
 
-    def __init__(self, size=None, name=None, variable_key=None):
-        super(CompactBilinearPooling, self).__init__(name=name, variable_key=variable_key)
+    def __init__(self, size=None, name=None):
         # assert GPU !!!
         # default arg size
         assert size is None or (isinstance(size, int) and size > 0)
         self.size = size
+        super(CompactBilinearPooling, self).__init__(name=name)
 
     def forward(self, *xs):
         assert len(xs) >= 1 and all(rank(x) == rank(xs[0]) for x in xs)
@@ -729,11 +844,11 @@ class CompactBilinearPooling(Unit):
             indices = tf.range(start=input_size, dtype=tf.int64)
             indices = tf.expand_dims(input=indices, axis=1)
             sketch_indices = tf.random_uniform(shape=(input_size,), maxval=size, dtype=tf.int64)
-            self.sketch_indices = Variable(key=self.subkey('indices' + str(n)), shape=input_size, init='constant', value=sketch_indices)
+            self.sketch_indices = Variable(name=('indices' + str(n)), shape=input_size, init='constant', value=sketch_indices)
             sketch_indices = tf.expand_dims(input=self.sketch_indices(), axis=1)
             sketch_indices = tf.concat(values=(indices, sketch_indices), axis=1)
             sketch_values = tf.random_uniform(shape=(input_size,))
-            self.sketch_values = Variable(key=self.subkey('values' + str(n)), shape=input_size, init='constant', value=sketch_values)
+            self.sketch_values = Variable(name=('values' + str(n)), shape=input_size, init='constant', value=sketch_values)
             sketch_values = tf.round(x=self.sketch_values())
             sketch_values = sketch_values * 2 - 1
             sketch_matrix = tf.SparseTensor(indices=sketch_indices, values=sketch_values, dense_shape=(input_size, size))
@@ -746,7 +861,7 @@ class CompactBilinearPooling(Unit):
             if p is None:
                 p = x
             else:
-                x = make_broadcastable(x=x, reference=p)
+                x, p = make_broadcastable(x, p)
                 p = tf.multiply(x=p, y=x)
         return tf.ifft(input=tf.real(input=p))
 
@@ -758,7 +873,6 @@ class Pooling(Unit):
         return isinstance(pool, str) and pool in ('none', 'average', 'avg', 'max', 'maximum')
 
     def __init__(self, pool='max', window=(2, 2), stride=2, padding='SAME', name=None):
-        super(Pooling, self).__init__(name=name)
         window = tuple(window)
         assert Pooling.valid(pool)
         assert len(window) == 2 and all(isinstance(n, int) and n > 0 for n in window)
@@ -772,6 +886,7 @@ class Pooling(Unit):
         else:
             assert len(stride) == 2 and stride[0] > 0 and stride[1] > 0
             self.stride = (1, stride[0], stride[1], 1)
+        super(Pooling, self).__init__(name=name)
 
     def forward(self, x):
         if self.pool == 'none':
@@ -809,11 +924,11 @@ class Pooling(Unit):
 
 class Embedding(Unit):
 
-    def __init__(self, indices, size, name=None, variable_key=None):
-        super(Embedding, self).__init__(name=name, variable_key=variable_key)
+    def __init__(self, indices, size, name=None):
         assert isinstance(indices, int) and indices > 0
         assert isinstance(size, int) and size > 0
-        self.embeddings = Variable(key=self.subkey('embeddings'), shape=(indices, size))
+        self.embeddings = Variable(name='embeddings', shape=(indices, size))
+        super(Embedding, self).__init__(name=name)
 
     def forward(self, x):
         return tf.nn.embedding_lookup(params=self.embeddings(), ids=x)
@@ -822,7 +937,6 @@ class Embedding(Unit):
 class Split(Unit):
 
     def __init__(self, axis=1, size=1, reduction=None, name=None):
-        super(Split, self).__init__(name=name)
         axis = (axis,) if isinstance(axis, int) else tuple(sorted(axis, reverse=True))
         size = (size,) if isinstance(size, int) else tuple(size)
         assert all(isinstance(a, int) and a >= 0 for a in axis)
@@ -830,6 +944,7 @@ class Split(Unit):
         self.axis = axis
         self.size = size
         self.reduction = None if reduction is None else Reduction(reduction=reduction)
+        super(Split, self).__init__(name=name)
 
     def forward(self, x):
         xs = [x]
@@ -844,11 +959,11 @@ class Split(Unit):
 
 class Relational(Unit):
 
-    def __init__(self, relation_unit, axis=1, relation_reduction='concat', reduction='sum', name=None, variable_key=None):
-        super(Relational, self).__init__(name=name, variable_key=variable_key)
+    def __init__(self, relation_unit, axis=1, relation_reduction='concat', reduction='sum', name=None):
         self.split = Split(axis=axis, size=2, reduction=relation_reduction)
         self.relation_unit = relation_unit
         self.reduction = Reduction(reduction=reduction)
+        super(Relational, self).__init__(name=name)
 
     def forward(self, xs, y):
         xs >>= self.split
@@ -858,8 +973,8 @@ class Relational(Unit):
 
 class Index(Unit):
 
-    def __init__(self, name=None, variable_key=None):
-        super(Index, self).__init__(name=name, variable_key=variable_key)
+    def __init__(self, name=None):
+        super(Index, self).__init__(name=name)
 
     def forward(self, x):
         index = None
@@ -878,50 +993,115 @@ class Index(Unit):
         index = tf.expand_dims(input=index, axis=0)
         multiples = [tf.shape(input=x)[0]] + [1] * (rank(x) - 1)
         index = tf.tile(input=index, multiples=multiples)
-        index >>= Print(size=64)
         return tf.concat(values=(x, index), axis=(rank(x) - 1))
+
+
+class Linear(Layer):
+
+    def __init__(self, size, bias=False, name=None):
+        assert isinstance(bias, bool)
+        if size == 0:
+            size = 1
+            self.squeeze = True
+        else:
+            self.squeeze = False
+        self.bias = Variable(name='bias', shape=size, init='zeros') if bias else None
+        super(Linear, self).__init__(size=size, name=name)
+
+    def forward(self, x):
+        assert 2 <= rank(x) <= 4
+        if rank(x) == 2:
+            self.weights = Variable(name='weights', shape=(shape(x)[-1], self.size), init='in-out')
+            x = tf.matmul(a=x, b=self.weights())
+        elif rank(x) == 3:
+            self.weights = Variable(name='weights', shape=(1, shape(x)[-1], self.size), init='in-out')
+            x = tf.nn.conv1d(value=x, filters=self.weights(), stride=1, padding='SAME')
+        elif rank(x) == 4:
+            self.weights = Variable(name='weights', shape=(1, 1, shape(x)[-1], self.size), init='in-out')
+            x = tf.nn.conv2d(input=x, filter=self.weights(), strides=(1, 1, 1, 1), padding='SAME')
+        if self.bias:
+            x = tf.nn.bias_add(value=x, bias=self.bias())
+        if self.squeeze:
+            x = tf.squeeze(input=x, axis=-1)
+        return x
 
 
 class Dense(Layer):
 
-    def __init__(self, size, bias=False, normalization=True, nonlinearity='relu', dropout=False, name=None, variable_key=None):
-        super(Dense, self).__init__(size=size, name=name, variable_key=variable_key)
+    def __init__(self, size, bias=False, normalization=True, activation='tanh', gated=False, norm_act_before=False, dropout=False, name=None):
         assert isinstance(bias, bool)
         assert isinstance(normalization, bool)
-        assert not nonlinearity or Nonlinearity.valid(nonlinearity)
+        assert not activation or Activation.valid(activation)
+        assert isinstance(gated, bool)
+        assert isinstance(norm_act_before, bool)
         assert not dropout or Dropout.valid(dropout)
-        self.weights_init = nonlinearity or 'in-out'
-        self.bias = Variable(key=self.subkey('bias'), shape=self.size, init='zeros') if bias else None
-        self.normalization = Normalization(variable_key=self.subkey('normalization')) if normalization else Identity()
-        self.nonlinearity = Nonlinearity(nonlinearity=nonlinearity) if nonlinearity else Identity()
+        if size == 0:
+            size = 1
+            self.squeeze = True
+        else:
+            self.squeeze = False
+        self.weights = Variable(name='weights', init=(activation or 'in-out'))
+        self.bias = Variable(name='bias', shape=size, init='zeros') if bias else None
+        self.normalization = Normalization() if normalization else Identity()
+        self.activation = Activation(activation=activation) if activation else Identity()
+        self.gated = gated
+        if gated:
+            self.gate_weights = Variable(name='weights', init='sigmoid')
+            self.gate_bias = Variable(name='bias', shape=size, init='zeros') if bias else None
+            self.gate_activation = Activation(activation='sigmoid')
+        self.norm_act_before = norm_act_before
         self.dropout = Dropout() if dropout else Identity()
+        super(Dense, self).__init__(size=size, name=name)
 
     def forward(self, x):
         assert 2 <= rank(x) <= 4
-        x >>= self.normalization
-        x >>= self.nonlinearity
+        if self.norm_act_before:
+            x >>= self.normalization
+            x >>= self.activation
         if rank(x) == 2:
-            self.weights = Variable(key=self.subkey('weights'), shape=(shape(x)[-1], self.size), init=self.weights_init)
+            self.weights.specify_shape(shape=(shape(x)[-1], self.size))
             x = tf.matmul(a=x, b=self.weights())
+            if self.gated:
+                self.gate_weights.specify_shape(shape=(shape(x)[-1], self.size))
+                gate = tf.matmul(a=x, b=self.gate_weights())
         elif rank(x) == 3:
-            self.weights = Variable(key=self.subkey('weights'), shape=(1, shape(x)[-1], self.size), init=self.weights_init)
+            self.weights.specify_shape(shape=(1, shape(x)[-1], self.size))
             x = tf.nn.conv1d(value=x, filters=self.weights(), stride=1, padding='SAME')
+            if self.gated:
+                self.gate_weights.specify_shape(shape=(1, shape(x)[-1], self.size))
+                gate = tf.nn.conv1d(value=x, filters=self.gate_weights(), stride=1, padding='SAME')
         elif rank(x) == 4:
-            self.weights = Variable(key=self.subkey('weights'), shape=(1, 1, shape(x)[-1], self.size), init=self.weights_init)
+            self.weights.specify_shape(shape=(1, 1, shape(x)[-1], self.size))
             x = tf.nn.conv2d(input=x, filter=self.weights(), strides=(1, 1, 1, 1), padding='SAME')
-        if self.bias:
+            if self.gated:
+                self.gate_weights.specify_shape(shape=(1, 1, shape(x)[-1], self.size))
+                gate = tf.nn.conv2d(input=x, filter=self.gate_weights(), strides=(1, 1, 1, 1), padding='SAME')
+        if self.bias is not None:
             x = tf.nn.bias_add(value=x, bias=self.bias())
+            if self.gated:
+                gate = tf.nn.bias_add(value=gate, bias=self.gate_bias())
+        if self.squeeze:
+            x = tf.squeeze(input=x, axis=-1)
+            if self.gated:
+                gate = tf.squeeze(input=gate, axis=-1)
+        if not self.norm_act_before:
+            x >>= self.normalization
+            x >>= self.activation
+        if self.gated:
+            x *= (gate >> self.gate_activation)
         return x >> self.dropout
 
 
 class Lstm(Layer):
 
-    def __init__(self, size, initial_state_variable=False, name=None, variable_key=None):
-        super(Lstm, self).__init__(size=size, name=name, variable_key=variable_key)
-        self.initial_state = Variable(key=self.subkey('init'), shape=(1, 2, self.size), dtype='float') if initial_state_variable else None
+    # variables not registered !!!
+
+    def __init__(self, size, initial_state_variable=False, name=None):
+        self.initial_state = Variable(name='init', shape=(1, 2, size), dtype='float') if initial_state_variable else None
+        super(Lstm, self).__init__(size=size, name=name)
 
     def forward(self, x=None, state=None):
-        lstm = tf.contrib.rnn.LSTMCell(num_units=self.size)  #, state_is_tuple=False)
+        lstm = tf.contrib.rnn.LSTMCell(num_units=self.size)  # state_is_tuple=False)
         if x is None:
             if self.initial_state is None:
                 return lstm, lstm.zero_state(batch_size=1, dtype=Model.dtype('float'))
@@ -935,9 +1115,11 @@ class Lstm(Layer):
 
 class Gru(Layer):
 
-    def __init__(self, size, initial_state_variable=True, name=None, variable_key=None):
-        super(Gru, self).__init__(size=size, name=name, variable_key=variable_key)
-        self.initial_state = Variable(key=self.subkey('init'), shape=(1, self.size), dtype='float') if initial_state_variable else None
+    # variables not registered !!!
+
+    def __init__(self, size, initial_state_variable=True, name=None):
+        self.initial_state = Variable(name='init', shape=(1, size), dtype='float') if initial_state_variable else None
+        super(Gru, self).__init__(size=size, name=name)
 
     def forward(self, x=None, state=None):
         gru = tf.contrib.rnn.GRUCell(num_units=self.size)
@@ -952,11 +1134,11 @@ class Gru(Layer):
 
 class Rnn(Layer):
 
-    def __init__(self, size, unit=Lstm, initial_state_variable=True, name=None, variable_key=None):
-        super(Rnn, self).__init__(size=size, name=name, variable_key=variable_key)
+    def __init__(self, size, unit=Lstm, initial_state_variable=True, name=None):
         assert issubclass(unit, Layer)
         assert isinstance(initial_state_variable, bool)
-        self.unit = unit(size=self.size, initial_state_variable=initial_state_variable, variable_key=self.subkey('unit'))
+        self.unit = unit(size=size, initial_state_variable=initial_state_variable)
+        super(Rnn, self).__init__(size=size, name=name)
 
     def forward(self, x, length=None):
         if length is not None and rank(length) == 2:
@@ -965,28 +1147,43 @@ class Rnn(Layer):
         unit, initial_state = self.unit()
         # initial_state = tf.tile(input=initial_state, multiples=(tf.shape(input=x)[0], 1))
         initial_state = initial_state(x)
-        x, state = tf.nn.dynamic_rnn(cell=unit, inputs=x, sequence_length=length, dtype=Model.dtype('float'))  #, initial_state=initial_state)
+        x, state = tf.nn.dynamic_rnn(cell=unit, inputs=x, sequence_length=length, dtype=Model.dtype('float'))  # initial_state=initial_state)
         return x, tf.stack(values=(state.c, state.h), axis=1)
 
 
 class Convolution(Layer):
 
-    def __init__(self, size, window=(3, 3), transposed=False, bias=False, normalization=True, nonlinearity='relu', stride=1, padding='SAME', name=None, variable_key=None):
-        super(Convolution, self).__init__(size=size, name=name, variable_key=variable_key)
+    def __init__(self, size, window=(3, 3), transposed=False, bias=False, normalization=True, activation='relu', norm_act_before=False, stride=1, padding='SAME', name=None):
         window = (window,) if isinstance(window, int) else tuple(window)
         assert 1 <= len(window) <= 2 and all(isinstance(n, int) and n > 0 for n in window)
         assert isinstance(transposed, bool) and (not transposed or len(window) == 2)
         assert isinstance(bias, bool)
-        assert isinstance(normalization, bool)
-        assert not nonlinearity or Nonlinearity.valid(nonlinearity)
+        assert isinstance(normalization, bool) or isinstance(normalization, tuple)
+        assert not activation or Activation.valid(activation)
+        assert isinstance(norm_act_before, bool)
         assert padding in ('SAME', 'VALID')
+        if size == 0:
+            size = 1
+            self.squeeze = True
+        else:
+            self.squeeze = False
         self.window = window
-        self.filters_init = nonlinearity or 'in-out'
+        self.filters_init = activation or 'in-out'
         self.transposed = transposed
-        self.bias = Variable(key=self.subkey('bias'), shape=(self.size,), init='zeros') if bias else None
+        self.bias = Variable(name='bias', shape=(size,), init='zeros') if bias else None
         self.bias = bias
-        self.normalization = Normalization(variable_key=self.subkey('normalization')) if normalization else Identity()
-        self.nonlinearity = Nonlinearity(nonlinearity=nonlinearity) if nonlinearity else Identity()
+        if isinstance(normalization, tuple):
+            assert len(normalization) == 2
+            self.normalization = Normalization(offset=normalization[0], scale=normalization[1])
+            self.requires_condition = True
+        elif normalization:
+            self.normalization = Normalization()
+            self.requires_condition = False
+        else:
+            self.normalization = Identity()
+            self.requires_condition = False
+        self.activation = Activation(activation=activation) if activation else Identity()
+        self.norm_act_before = norm_act_before
         self.padding = padding
         if isinstance(stride, int):
             assert stride > 0
@@ -994,15 +1191,20 @@ class Convolution(Layer):
         else:
             assert len(stride) == 2 and stride[0] > 0 and stride[1] > 0
             self.stride = (1, stride[0], stride[1], 1)
+        super(Convolution, self).__init__(size=size, name=name)
 
-    def forward(self, x):
-        x >>= self.normalization
-        x >>= self.nonlinearity
+    def forward(self, x, condition=None):
+        if self.norm_act_before:
+            if self.requires_condition:
+                x = (x, condition) >> self.normalization
+            else:
+                x >>= self.normalization
+            x >>= self.activation
         if self.transposed:
             filters_shape = self.window + (self.size, shape(x)[-1])
         else:
             filters_shape = self.window + (shape(x)[-1], self.size)
-        self.filters = Variable(key=self.subkey('filters'), shape=filters_shape, init=self.filters_init)
+        self.filters = Variable(name='filters', shape=filters_shape, init=self.filters_init)
         if len(self.window) == 1:
             x = tf.nn.conv1d(value=x, filters=self.filters(), stride=self.stride, padding=self.padding)
         elif self.transposed:
@@ -1012,17 +1214,28 @@ class Convolution(Layer):
             x = tf.nn.conv2d(input=x, filter=self.filters(), strides=self.stride, padding=self.padding)
         if self.bias:
             x = tf.nn.bias_add(value=x, bias=self.bias())
-        return x
+        if self.squeeze:
+            x = tf.squeeze(input=x, axis=-1)
+        if not self.norm_act_before:
+            if self.requires_condition:
+                x = (x, condition) >> self.normalization
+            else:
+                x >>= self.normalization
+            x >>= self.activation
+        if self.requires_condition:
+            return x, condition
+        else:
+            return x
 
 
 class NgramConvolution(Layer):
 
-    def __init__(self, size, ngrams=3, padding='VALID', name=None, variable_key=None):
-        super(NgramConvolution, self).__init__(size=size, name=name, variable_key=variable_key)
+    def __init__(self, size, ngrams=3, padding='VALID', name=None):
         self.convolutions = []
         for ngram in range(1, ngrams + 1):  # not start with 1
-            convolution = Convolution(size=self.size, window=ngram, normalization=False, nonlinearity='relu', padding=padding, variable_key=self.subkey(str(ngram) + 'gram'))  # norm, nonlin?
+            convolution = Convolution(size=size, window=ngram, normalization=False, activation='relu', padding=padding)  # norm, act?
             self.convolutions.append(convolution)
+        super(NgramConvolution, self).__init__(size=size, name=name)
 
     def forward(self, x):
         embeddings = [x >> convolution for convolution in self.convolutions]
@@ -1034,15 +1247,58 @@ class NgramConvolution(Layer):
         return tf.concat(values=embeddings, axis=1)
 
 
+# class Expand(Layer):
+
+#     def __init__(self, size, bottleneck=False, unit=Convolution, name=None):
+#         assert issubclass(unit, Layer)
+#         self.bottleneck = unit(size=(size * bottleneck)) if bottleneck else Identity()
+#         self.unit = unit(size=size)
+#         super(Residual, self).__init__(size=size, name=name)
+
+#     def forward(self, x):
+#         fx = x >> self.bottleneck >> self.unit
+#         return tf.concat(values=(x, fx), axis=(rank(x) - 1))
+
+
+class Repeat(LayerStack):
+
+    def __init__(self, layer, size, name=None, **kwargs):
+        kwargs_list = [dict(size=s) for n, s in enumerate(size)]
+        for name, value in kwargs.items():
+            if isinstance(value, list):
+                assert len(value) == len(kwargs_list)
+                for n in range(len(value)):
+                    kwargs_list[n][name] = value[n]
+            else:
+                for n in range(len(kwargs_list)):
+                    kwargs_list[n][name] = value
+        self.layers = list()
+        for kwargs in kwargs_list:
+            self.layers.append(layer(**dict(kwargs)))
+        super(Repeat, self).__init__(name=name)
+
+
+class ConvolutionalNet(LayerStack):
+
+    def __init__(self, sizes, depths, pool='max', name=None):
+        assert Pooling.valid(pool)
+        self.layers = list()
+        for m, (size, depth) in enumerate(zip(sizes, depths)):
+            for n in range(depth):
+                self.layers.append(Convolution(size=size))
+            self.layers.append(Pooling(pool=pool))  # also only in between?
+        super(LayerStack, self).__init__(name=name)
+
+
 class Residual(Layer):
 
-    def __init__(self, size, unit=Convolution, depth=2, reduction='sum', name=None, variable_key=None):
-        super(Residual, self).__init__(size=size, name=name, variable_key=variable_key)
+    def __init__(self, size, unit=Convolution, depth=2, reduction='sum', name=None):
         assert issubclass(unit, Layer)
         assert isinstance(depth, int) and depth >= 0
         self.units = []
         for n in range(depth):
-            self.units.append(unit(size=self.size, variable_key=self.subkey('unit' + str(n))))
+            self.units.append(unit(size=size))
+        super(Residual, self).__init__(size=size, name=name)
 
     def forward(self, x):
         res = x
@@ -1051,31 +1307,42 @@ class Residual(Layer):
         return tf.add(x=x, y=res)
 
 
-class Expand(Layer):
+class ResidualNet(LayerStack):
 
-    def __init__(self, size, bottleneck=False, unit=Convolution, name=None, variable_key=None):
-        super(Residual, self).__init__(size=size, name=name, variable_key=variable_key)
-        assert issubclass(unit, Layer)
-        self.bottleneck = unit(size=(self.size * bottleneck), variable_key=self.subkey('bottleneck')) if bottleneck else Identity()
-        self.unit = unit(size=self.size, variable_key=self.subkey('unit'))
+    # citation!
 
-    def forward(self, x):
-        fx = x >> self.bottleneck >> self.unit
-        return tf.concat(values=(x, fx), axis=(rank(x) - 1))
+    def __init__(self, sizes, depths, layer=Convolution, transition=None, pool='max', name=None):
+        assert Pooling.valid(pool)
+        self.layers = list()
+        for m, (size, depth) in enumerate(zip(sizes, depths)):
+            if m > 0:
+                self.layers.append(Pooling(pool=pool))
+            # if transition:
+            #     self.layers.append(transition(size=size, normalize=False, activation))
+            for n in range(depth):
+                if m == 0:
+                    if n == 0:
+                        self.layers.append(layer(size=size, normalization=False, activation=None))
+                        layer = (lambda size: layer(size=size, norm_act_before=True))  # pre activation
+                else:
+                    self.layers.append(Residual(size=size, unit=layer))
+        self.layers.append(Normalization())
+        self.layers.append(Activation())
+        super(LayerStack, self).__init__(name=name)
 
 
 class Fractal(Layer):
 
-    def __init__(self, size, unit=Convolution, depth=3, reduction='mean', name=None, variable_key=None):
-        super(Fractal, self).__init__(size=size, name=name, variable_key=variable_key)
+    def __init__(self, size, unit=Convolution, depth=3, reduction='mean', name=None):
         assert issubclass(unit, Layer)
         assert isinstance(depth, int) and depth >= 0
         self.depth = depth
         if depth > 0:
-            self.fx = Fractal(size=self.size, unit=unit, depth=(depth - 1), variable_key=self.subkey('fractal' + str(depth)))
-            self.ffx = Fractal(size=self.size, unit=unit, depth=(depth - 1), variable_key=self.subkey('fffractal' + str(depth)))
-            self.unit = unit(size=self.size, variable_key=self.subkey('unit' + str(depth)))
+            self.fx = Fractal(size=size, unit=unit, depth=(depth - 1))
+            self.ffx = Fractal(size=size, unit=unit, depth=(depth - 1))
+            self.unit = unit(size=size)
             self.reduction = Reduction(reduction=reduction)
+        super(Fractal, self).__init__(size=size, name=name)
 
     def forward(self, x):
         if self.depth == 0:
@@ -1085,62 +1352,18 @@ class Fractal(Layer):
         return (x, y) >> self.reduction
 
 
-class Repeat(LayerStack):
+class FractalNet(LayerStack):
 
-    def __init__(self, layer, size, name=None, variable_key=None, **kwargs):
-        super(Repeat, self).__init__(name=name, variable_key=variable_key)
-        kwargs_list = [dict(size=s, variable_key=self.subkey('layer-{}'.format(n))) for n, s in enumerate(size)]
-        for name, value in kwargs.items():
-            if isinstance(value, list):
-                assert len(value) == len(kwargs_list)
-                for n in range(len(value)):
-                    kwargs_list[n][name] = value[n]
-            else:
-                for n in range(len(kwargs_list)):
-                    kwargs_list[n][name] = value
-        for kwargs in kwargs_list:
-            self.layers.append(layer(**dict(kwargs)))
-
-
-class PoolingNet(LayerStack):
-
-    def __init__(self, layer, sizes, depths, transition=None, pool='max', name=None, variable_key=None):
-        super(PoolingNet, self).__init__(name=name, variable_key=variable_key)
+    def __init__(self, sizes, layer=Convolution, pool='max', name=None):
         assert Pooling.valid(pool)
-        n = 0
-        for size, depth in zip(sizes, depths):
-            if transition:
-                self.layers.append(transition(size=size, variable_key=self.subkey('transition-{}'.format(depth))))
-            for n in range(depth):
-                self.layers.append(layer(size=size, variable_key=self.subkey('layer-{}-{}'.format(depth, n))))
-                n += 1
-            self.layers.append(Pooling(pool=pool))
-
-
-class ConvolutionalNet(PoolingNet):
-
-    def __init__(self, sizes, depths, name=None, variable_key=None):
-        super(ConvolutionalNet, self).__init__(layer=Convolution, sizes=sizes, depths=depths, name=name, variable_key=variable_key)
-
-
-class ResidualNet(PoolingNet):
-
-    def __init__(self, sizes, depths, name=None, variable_key=None):  # Residual configurable which layer etc
-        super(ResidualNet, self).__init__(layer=Residual, sizes=sizes, depths=depths, transition=Convolution, name=name, variable_key=variable_key)
-
-
-class DenseNet(PoolingNet):
-
-    def __init__(self, sizes, depths, name=None, variable_key=None):  # Residual configurable which layer etc
-        super(DenseNet, self).__init__(layer=Expand, sizes=sizes, depths=depths, transition=Convolution, name=name, variable_key=variable_key)
-
-
-class FractalNet(PoolingNet):
-
-    def __init__(self, sizes, name=None, variable_key=None):  # Fractal configurable which layer etc
-        super(FractalNet, self).__init__(layer=Fractal, sizes=sizes, depths=([1] * len(sizes)), transition=Convolution, name=name, variable_key=variable_key)
+        self.layers = list()
+        for m, size in enumerate(sizes):
+            if m > 0:
+                self.layers.append(Pooling(pool=pool))
+            # if transition:
+            #     self.layers.append(transition(size=size, normalize=False, activation))
+            self.layers.append(Fractal(size=size, unit=layer))
+        super(LayerStack, self).__init__(name=name)
 
 
 FullyConnected = Full = FC = Dense
-
-Linear = (lambda size, bias=False, name=None, variable_key=None: Dense(size=size, bias=bias, normalization=False, nonlinearity=None, dropout=False, name=name, variable_key=variable_key))
