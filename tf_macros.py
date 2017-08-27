@@ -86,27 +86,7 @@ class Model(object):
         else:
             return dtype
 
-    @staticmethod
-    def register_tensor(key, tensor):
-        assert key not in ('loss', 'dropout')
-        assert key not in Model.current.tensors
-        Model.current.tensors[key] = tensor
-
-    @staticmethod
-    def register_variable(key, variable, num_parameters, num_bytes):
-        if key in Model.current.variables:
-            assert variable == Model.current.variables[key]
-        else:
-            Model.current.variables[key] = variable
-            Model.current.num_parameters += num_parameters
-            Model.current.num_bytes += num_bytes
-
-    @staticmethod
-    def register_placeholder(key, placeholder):
-        assert key not in Model.current.placeholders
-        Model.current.placeholders[key] = placeholder
-
-    def __init__(self, name=None, optimizer='adam', learning_rate=0.0001, weight_decay=0.0001, clip_gradients=10.0, model_file=None, summary_file=None):
+    def __init__(self, name=None, optimizer='adam', learning_rate=0.001, weight_decay=0.0, clip_gradients=10.0, model_file=None, summary_file=None):
         assert name is None or isinstance(name, str)
         assert optimizer in ('adam',)
         assert isinstance(learning_rate, float)
@@ -134,6 +114,23 @@ class Model(object):
             return 'Model'
         else:
             return self.name
+
+    def register_tensor(self, key, tensor):
+        assert key not in ('loss', 'dropout')
+        assert key not in self.tensors
+        self.tensors[key] = tensor
+
+    def register_variable(self, key, variable, num_parameters, num_bytes):
+        if key in self.variables:
+            assert variable == self.variables[key]
+        else:
+            self.variables[key] = variable
+            self.num_parameters += num_parameters
+            self.num_bytes += num_bytes
+
+    def register_placeholder(self, key, placeholder):
+        assert key not in self.placeholders
+        self.placeholders[key] = placeholder
 
     def __enter__(self):
         assert Model.current is None
@@ -242,6 +239,7 @@ class Unit(object):
     _index = 0
 
     def __init__(self, name=None):
+        assert Model.current is not None
         assert name is None or isinstance(name, str)
         if name is None:
             name = self.__class__.__name__ + str(self.__class__._index)
@@ -264,18 +262,18 @@ class Unit(object):
         if isinstance(output, tf.Tensor):
             if output_key is not None:
                 self.outputs[output_key] = output
-                Model.register_tensor(key=output_key, tensor=output)
+                Model.current.register_tensor(key=output_key, tensor=output)
         elif len(output) == 1:
             output = output[0]
             if output_key is not None:
                 self.outputs[output_key] = output
-                Model.register_tensor(key=output_key, tensor=output)
+                Model.current.register_tensor(key=output_key, tensor=output)
         else:
             output = tuple(output)
             if output_key is not None:
                 self.outputs[output_key] = output
                 for n, tensor in enumerate(output):
-                    Model.register_tensor(key=(output_key + str(n)), tensor=tensor)
+                    Model.current.register_tensor(key=(output_key + str(n)), tensor=tensor)
         return output
 
     def __rshift__(self, other):
@@ -371,8 +369,10 @@ class Variable(Unit):
         super(Variable, self).__init__(name=name)
 
     def specify_shape(self, shape):
-        assert self.shape is None
-        self.shape = shape
+        if self.shape is None:
+            self.shape = shape
+        else:
+            assert self.shape == shape
 
     def forward(self):
         assert self.shape is not None
@@ -398,7 +398,7 @@ class Variable(Unit):
         variable = tf.get_variable(name=self.name, shape=self.shape, dtype=self.dtype, initializer=initializer)
         num_parameters = product(self.shape)
         num_bytes = num_parameters * self.dtype_bytes
-        Model.register_variable(key='{}/{}'.format(tf.get_variable_scope().name, self.name), variable=variable, num_parameters=num_parameters, num_bytes=num_bytes)
+        Model.current.register_variable(key='{}/{}'.format(tf.get_variable_scope().name, self.name), variable=variable, num_parameters=num_parameters, num_bytes=num_bytes)
         return tf.identity(input=variable)
 
 
@@ -422,7 +422,7 @@ class Input(Unit):
     def forward(self):
         if self.tensor is None:
             placeholder = tf.placeholder(dtype=self.dtype, shape=self.shape, name=self.name)
-            Model.register_placeholder(key=self.name, placeholder=placeholder)
+            Model.current.register_placeholder(key=self.name, placeholder=placeholder)
             self.tensor = tf.identity(input=placeholder)
         return self.tensor
 
@@ -442,7 +442,7 @@ class Binary(Input):
         if self.soft > 0.0:
             noise = tf.random_uniform(shape=(1, 1), minval=0.0, maxval=self.soft)
             correct = tf.abs(x=(correct - noise))
-        x >>= Linear(size=1)
+        x >>= Linear(size=0)
         x = (tf.tanh(x=x) + 1.0) / 2.0
         cross_entropy = -(correct * tf.log(x=x + 1e-10) + (1.0 - correct) * tf.log(x=1.0 - x + 1e-10))
         loss = tf.reduce_mean(input_tensor=cross_entropy)
@@ -450,7 +450,7 @@ class Binary(Input):
         prediction = tf.cast(x=tf.greater(x=x, y=tf.constant(value=0.5)), dtype=Model.dtype('float'))
         correct = tf.cast(x=tf.equal(x=prediction, y=correct), dtype=Model.dtype('float'))
         accuracy = tf.reduce_mean(input_tensor=correct)
-        Model.register_tensor(key=(self.name + '-accuracy'), tensor=accuracy)
+        Model.current.register_tensor(key=(self.name + '-accuracy'), tensor=accuracy)
         return y
 
 
@@ -483,8 +483,8 @@ class Classification(Input):
         true_positive = tf.reduce_sum(input_tensor=tf.minimum(x=prediction, y=correct), axis=1)
         precision = tf.reduce_mean(input_tensor=tf.divide(x=true_positive, y=selected), axis=0)
         recall = tf.reduce_mean(input_tensor=tf.divide(x=true_positive, y=relevant), axis=0)
-        Model.register_tensor(key=(self.name + '-precision'), tensor=precision)
-        Model.register_tensor(key=(self.name + '-recall'), tensor=recall)
+        Model.current.register_tensor(key=(self.name + '-precision'), tensor=precision)
+        Model.current.register_tensor(key=(self.name + '-recall'), tensor=recall)
         return y
 
 
@@ -514,15 +514,23 @@ class Identity(Unit):
 
 class Print(Unit):
 
-    def __init__(self, size=10, times=None, name=None):
+    def __init__(self, size=10, times=None, prefix=None, name=None):
         assert isinstance(size, int) and size > 0
         assert times is None or isinstance(times, int) and times > 0
+        assert prefix is None or isinstance(prefix, str)
         self.size = size
         self.times = times
+        self.prefix = prefix
         super(Print, self).__init__(name=name)
 
     def forward(self, *xs):
-        return (tf.Print(input_=xs[0], data=xs, summarize=self.size, first_n=self.times),) + tuple(xs[1:])
+        if self.prefix is None or self.prefix[-2:] == ': ':
+            message = self.prefix
+        elif self.prefix[-1] == ':':
+            message = self.prefix + ' '
+        else:
+            message = self.prefix + ': '
+        return (tf.Print(input_=xs[0], data=xs, message=message, first_n=self.times, summarize=self.size),) + tuple(xs[1:])
 
 
 class Select(Unit):
@@ -627,7 +635,7 @@ class Reduction(Unit):
     def valid(reduction):
         return isinstance(reduction, str) and reduction in ('cbp', 'collapse', 'concat', 'conv', 'conv2d', 'last', 'max', 'mean', 'min', 'prod', 'stack', 'sum')
 
-    def __init__(self, reduction, axis=-1, arg=None, name=None):
+    def __init__(self, reduction, axis=-1, arg=-1, name=None):
         assert Reduction.valid(reduction)
         if isinstance(axis, int):
             axis = (axis,)
@@ -638,7 +646,7 @@ class Reduction(Unit):
             assert len(axis) > 0 and all(isinstance(a, int) for a in axis)
             axis = tuple(sorted(axis))
         assert len(set(axis)) == len(axis)
-        assert arg is None or reduction in ('concat', 'stack')
+        assert isinstance(arg, int)
         self.reduction = reduction
         self.axis = axis
         self.arg = arg
@@ -709,11 +717,8 @@ class Reduction(Unit):
                     xs = [y for x in xs for y in tf.unstack(value=x, axis=axis)]
 
         if self.reduction in ('concat', 'stack'):
-            if self.arg is None:
-                self.arg = rank(xs[0]) - 1
-            else:
-                self.arg = self.arg if self.arg >= 0 else rank(xs[0]) + self.arg
-                assert 0 <= self.arg < rank(xs[0])
+            self.arg = self.arg if self.arg >= 0 else rank(xs[0]) + self.arg
+            assert 0 <= self.arg < rank(xs[0])
             xs = make_least_common_shape(xs, ignore_ranks=(self.arg,))
 
         if self.reduction == 'collapse':
@@ -778,32 +783,32 @@ class Reduction(Unit):
             return tf.reduce_sum(input_tensor=x, axis=self.axis)
 
 
-class Concatenation(Unit):
+# class Concatenation(Unit):
 
-    def __init__(self, axis=-1, name=None):
-        assert isinstance(axis, int)
-        self.axis = axis
-        super(Concatenation, self).__init__(name=name)
+#     def __init__(self, axis=-1, name=None):
+#         assert isinstance(axis, int)
+#         self.axis = axis
+#         super(Concatenation, self).__init__(name=name)
 
-    def forward(self, *xs):
-        assert len(xs) >= 1 and all(rank(x) == rank(xs[0]) for x in xs)  # what if length 0?
-        axis = self.axis if self.axis >= 0 else rank(xs[0]) + self.axis
-        assert rank(xs[0]) > axis
-        return tf.concat(values=xs, axis=axis)
+#     def forward(self, *xs):
+#         assert len(xs) >= 1 and all(rank(x) == rank(xs[0]) for x in xs)  # what if length 0?
+#         axis = self.axis if self.axis >= 0 else rank(xs[0]) + self.axis
+#         assert rank(xs[0]) > axis
+#         return tf.concat(values=xs, axis=axis)
 
 
-class Stack(Unit):
+# class Stack(Unit):
 
-    def __init__(self, axis=-1, name=None):
-        assert isinstance(axis, int)
-        self.axis = axis
-        super(Stack, self).__init__(name=name)
+#     def __init__(self, axis=-1, name=None):
+#         assert isinstance(axis, int)
+#         self.axis = axis
+#         super(Stack, self).__init__(name=name)
 
-    def forward(self, *xs):
-        assert len(xs) >= 1 and all(rank(x) == rank(xs[0]) for x in xs)
-        axis = self.axis if self.axis >= 0 else rank(xs[0]) + self.axis + 1
-        assert rank(xs[0]) >= axis
-        return tf.stack(values=xs, axis=axis)
+#     def forward(self, *xs):
+#         assert len(xs) >= 1 and all(rank(x) == rank(xs[0]) for x in xs)
+#         axis = self.axis if self.axis >= 0 else rank(xs[0]) + self.axis + 1
+#         assert rank(xs[0]) >= axis
+#         return tf.stack(values=xs, axis=axis)
 
 
 class Attention(Unit):
@@ -949,11 +954,11 @@ class Split(Unit):
     def forward(self, x):
         xs = [x]
         for a in self.axis:
-            xs = [y for ys in xs for y in tf.unstack(value=ys, axis=a)]
+            xs = [y for x in xs for y in tf.unstack(value=x, axis=a)]
         if self.size != (1,):
             xs = chain(*(combinations(xs, r=s) for s in self.size))  # others interesting? permutation, product?
         if self.reduction is not None:
-            xs = [y >> self.reduction for y in xs]
+            xs = [x >> self.reduction for x in xs]
         return tuple(xs)
 
 
@@ -967,7 +972,7 @@ class Relational(Unit):
 
     def forward(self, xs, y):
         xs >>= self.split
-        xs = [(x, y) >> Concatenation() >> self.relation_unit for x in xs]
+        xs = [(x, y) >> Reduction(reduction='concat') >> self.relation_unit for x in xs]
         return xs >> self.reduction
 
 
