@@ -180,6 +180,8 @@ class Model(object):
         grads_and_vars = [(tf.clip_by_value(t=grad, clip_value_min=-self.clip_gradients, clip_value_max=self.clip_gradients), var) for grad, var in grads_and_vars]
         self.optimization = optimizer.apply_gradients(grads_and_vars=grads_and_vars)
         global_variables_initializer = tf.global_variables_initializer()
+        if self.model_file is not None:
+            self.saver = tf.train.Saver()
         if self.summary_file is not None:
             tf.summary.scalar(name='loss', tensor=loss)
             for variable in tf.trainable_variables():
@@ -190,8 +192,6 @@ class Model(object):
         self.defined = True
 
         self.session = tf.Session()
-        if self.model_file is not None:
-            self.saver = tf.train.Saver()
         if restore:
             assert self.model_file
             self.saver.restore(sess=self.session, save_path=self.model_file)
