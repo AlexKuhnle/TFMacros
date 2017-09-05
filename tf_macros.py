@@ -19,10 +19,8 @@ def product(xs):
     return prod
 
 
-def make_least_common_shape(*xs, ignore_ranks=()):
-    assert len(xs) > 0
-    if len(xs) == 1 and not isinstance(xs[0], tf.Tensor):
-        xs = xs[0]
+def make_least_common_shape(xs, ignore_ranks=()):
+    assert len(xs) > 1
     shapes = [shape(x) for x in xs]
     common_rank = len(shapes[0])
     assert all(len(s) == common_rank for s in shapes)
@@ -37,7 +35,7 @@ def make_least_common_shape(*xs, ignore_ranks=()):
     return ys
 
 
-def make_broadcastable(*xs):
+def make_broadcastable(xs):
     assert len(xs) > 0
     if len(xs) == 1 and not isinstance(xs[0], tf.Tensor):
         xs = xs[0]
@@ -86,7 +84,7 @@ class Model(object):
         else:
             return dtype
 
-    def __init__(self, name=None, optimizer='adam', learning_rate=0.001, weight_decay=0.0, clip_gradients=10.0, model_file=None, summary_file=None):
+    def __init__(self, name=None, optimizer='adam', learning_rate=0.001, weight_decay=0.0, clip_gradients=1.0, model_file=None, summary_file=None):
         assert name is None or isinstance(name, str)
         assert optimizer in ('adam',)
         assert isinstance(learning_rate, float)
@@ -143,7 +141,7 @@ class Model(object):
 
     def __exit__(self, type, value, tb):
         if type is not None:
-            assert False
+            raise
         if self.defined:
             self.coordinator.request_stop()
             self.coordinator.join(threads=self.queue_threads)
@@ -254,7 +252,7 @@ class Unit(object):
     def __str__(self):
         return self.name
 
-    def __call__(self, *inputs, output_key=None):
+    def __call__(self, inputs=(), output_key=None):
         assert output_key is None or isinstance(output_key, str)
         if output_key is not None and output_key in self.outputs:
             return self.outputs[output_key]
@@ -281,14 +279,14 @@ class Unit(object):
         if self.__class__.num_in == 0:
             inputs = self()
             inputs = (inputs,) if isinstance(inputs, tf.Tensor) else inputs
-            return other(*inputs)
+            return other(inputs=inputs)
         else:
             return Composed(first=self, second=other)
 
     def __rrshift__(self, other):
         composed = False
         if isinstance(other, tf.Tensor):
-            return self(other)
+            return self(inputs=(other,))
         inputs = []
         for x in other:
             if isinstance(x, tf.Tensor):
@@ -303,7 +301,7 @@ class Unit(object):
         if composed:
             return Composed(first=inputs, second=self)
         else:
-            return self(*inputs)
+            return self(inputs=inputs)
 
 
 class Composed(Unit):
@@ -696,7 +694,7 @@ class Reduction(Unit):
                 return y
 
             elif self.reduction in ('collapse', 'conv', 'conv2d'):
-                xs = make_least_common_shape(xs)
+                xs = make_least_common_shape(xs=xs)
                 x = tf.stack(values=xs, axis=axis)
 
         else:
@@ -719,7 +717,7 @@ class Reduction(Unit):
         if self.reduction in ('concat', 'stack'):
             self.arg = self.arg if self.arg >= 0 else rank(xs[0]) + self.arg
             assert 0 <= self.arg < rank(xs[0])
-            xs = make_least_common_shape(xs, ignore_ranks=(self.arg,))
+            xs = make_least_common_shape(xs=xs, ignore_ranks=(self.arg,))
 
         if self.reduction == 'collapse':
             assert all(axis == n for n, axis in enumerate(self.axis, self.axis[0]))
@@ -751,15 +749,15 @@ class Reduction(Unit):
             else:
                 for axis in reversed(self.axis):
                     if axis == 0:
-                        x = x[-1, ...]
+                        x = x[-1, Ellipsis]
                     elif axis == 1:
-                        x = x[:, -1, ...]
+                        x = x[:, -1, Ellipsis]
                     elif axis == 2:
-                        x = x[:, :, -1, ...]
+                        x = x[:, :, -1, Ellipsis]
                     elif axis == 3:
-                        x = x[:, :, :, -1, ...]
+                        x = x[:, :, :, -1, Ellipsis]
                     elif axis == 4:
-                        x = x[:, :, :, :, -1, ...]
+                        x = x[:, :, :, :, -1, Ellipsis]
                     else:
                         assert False
                 return x
@@ -817,7 +815,7 @@ class Attention(Unit):
         assert isinstance(assessment, Unit)
         self.assessment = assessment
         self.softmax = Activation(activation='softmax')
-        self.reduction = Reduction(reduction='sum', axis=(1, ..., -2))
+        self.reduction = Reduction(reduction='sum', axis=(1, Ellipsis, -2))
         super(Attention, self).__init__(name=name)
 
     def forward(self, x, query):
@@ -866,7 +864,7 @@ class CompactBilinearPooling(Unit):
             if p is None:
                 p = x
             else:
-                x, p = make_broadcastable(x, p)
+                x, p = make_broadcastable(xs=(x, p))
                 p = tf.multiply(x=p, y=x)
         return tf.ifft(input=tf.real(input=p))
 
@@ -1298,7 +1296,6 @@ class ConvolutionalNet(LayerStack):
 class Residual(Layer):
 
     def __init__(self, size, unit=Convolution, depth=2, reduction='sum', name=None):
-        assert issubclass(unit, Layer)
         assert isinstance(depth, int) and depth >= 0
         self.units = []
         for n in range(depth):
@@ -1309,6 +1306,8 @@ class Residual(Layer):
         res = x
         for unit in self.units:
             res >>= unit
+        if shape(x) != shape(res):
+            x >>= self.units[0]
         return tf.add(x=x, y=res)
 
 
@@ -1328,9 +1327,9 @@ class ResidualNet(LayerStack):
                 if m == 0:
                     if n == 0:
                         self.layers.append(layer(size=size, normalization=False, activation=None))
-                        layer = (lambda size: layer(size=size, norm_act_before=True))  # pre activation
+                        _layer = (lambda size: layer(size=size, norm_act_before=True))  # pre activation
                 else:
-                    self.layers.append(Residual(size=size, unit=layer))
+                    self.layers.append(Residual(size=size, unit=_layer))
         self.layers.append(Normalization())
         self.layers.append(Activation())
         super(LayerStack, self).__init__(name=name)
@@ -1339,19 +1338,18 @@ class ResidualNet(LayerStack):
 class Fractal(Layer):
 
     def __init__(self, size, unit=Convolution, depth=3, reduction='mean', name=None):
-        assert issubclass(unit, Layer)
         assert isinstance(depth, int) and depth >= 0
         self.depth = depth
+        self.unit = unit(size=size)
         if depth > 0:
             self.fx = Fractal(size=size, unit=unit, depth=(depth - 1))
             self.ffx = Fractal(size=size, unit=unit, depth=(depth - 1))
-            self.unit = unit(size=size)
             self.reduction = Reduction(reduction=reduction)
         super(Fractal, self).__init__(size=size, name=name)
 
     def forward(self, x):
         if self.depth == 0:
-            return x
+            return x >> self.unit
         y = x >> self.fx >> self.ffx
         x >>= self.unit
         return (x, y) >> self.reduction
