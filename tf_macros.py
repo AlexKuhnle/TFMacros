@@ -1265,8 +1265,8 @@ class NgramConvolution(Layer):
 
 class Repeat(LayerStack):
 
-    def __init__(self, layer, size, name=None, **kwargs):
-        kwargs_list = [dict(size=s) for n, s in enumerate(size)]
+    def __init__(self, layer, sizes, name=None, **kwargs):
+        kwargs_list = [dict(size=size) for n, size in enumerate(sizes)]
         for name, value in kwargs.items():
             if isinstance(value, list):
                 assert len(value) == len(kwargs_list)
