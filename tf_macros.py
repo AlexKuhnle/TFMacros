@@ -131,6 +131,7 @@ class Model(object):
         self.placeholders[key] = placeholder
 
     def __enter__(self):
+        tf.reset_default_graph()
         assert Model.current is None
         Model.current = self
         self.scope = tf.variable_scope(str(self))
@@ -145,8 +146,7 @@ class Model(object):
         if self.defined:
             self.coordinator.request_stop()
             self.coordinator.join(threads=self.queue_threads)
-            if self.model_file:
-                self.saver.save(sess=self.session, save_path=self.model_file)
+            self.save()
         else:
             for name, variable in self.variables.items():
                 regularization = self.weight_decay * tf.nn.l2_loss(t=variable, name=(name + '-regularization'))
@@ -159,11 +159,11 @@ class Model(object):
             grads_and_vars = [(tf.clip_by_value(t=grad, clip_value_min=-self.clip_gradients, clip_value_max=self.clip_gradients), var) for grad, var in grads_and_vars]
             self.optimization = optimizer.apply_gradients(grads_and_vars=grads_and_vars)
             self.scope.__exit__(type, value, tb)
-            assert False
         assert Model.current is not None
         Model.current = None
 
     def finalize(self, restore=False):
+        assert not self.defined
         for name, variable in self.variables.items():
             regularization = self.weight_decay * tf.nn.l2_loss(t=variable, name=(name + '-regularization'))
             tf.losses.add_loss(loss=regularization, loss_collection=tf.GraphKeys.REGULARIZATION_LOSSES)
@@ -196,6 +196,11 @@ class Model(object):
             self.summary_writer = tf.summary.FileWriter(logdir=self.summary_file, graph=self.session.graph)
         self.coordinator = tf.train.Coordinator()
         self.queue_threads = tf.train.start_queue_runners(sess=self.session, coord=self.coordinator)
+
+    def save(self):
+        assert self.defined
+        if self.model_file:
+            self.saver.save(sess=self.session, save_path=self.model_file)
 
     def __call__(self, query=None, data=None, optimize=True, summarize=True, dropout=0.0):
         assert self.session
@@ -448,7 +453,7 @@ class Binary(Input):
         prediction = tf.cast(x=tf.greater(x=x, y=tf.constant(value=0.5)), dtype=Model.dtype('float'))
         correct = tf.cast(x=tf.equal(x=prediction, y=correct), dtype=Model.dtype('float'))
         accuracy = tf.reduce_mean(input_tensor=correct)
-        Model.current.register_tensor(key=(self.name + '-accuracy'), tensor=accuracy)
+        Model.current.register_tensor(key=(self.name + '_accuracy'), tensor=accuracy)
         return y
 
 
@@ -481,8 +486,10 @@ class Classification(Input):
         true_positive = tf.reduce_sum(input_tensor=tf.minimum(x=prediction, y=correct), axis=1)
         precision = tf.reduce_mean(input_tensor=tf.divide(x=true_positive, y=selected), axis=0)
         recall = tf.reduce_mean(input_tensor=tf.divide(x=true_positive, y=relevant), axis=0)
-        Model.current.register_tensor(key=(self.name + '-precision'), tensor=precision)
-        Model.current.register_tensor(key=(self.name + '-recall'), tensor=recall)
+        fscore = (2 * precision * recall) / (precision + recall)
+        Model.current.register_tensor(key=(self.name + '_precision'), tensor=precision)
+        Model.current.register_tensor(key=(self.name + '_recall'), tensor=recall)
+        Model.current.register_tensor(key=(self.name + '_fscore'), tensor=fscore)
         return y
 
 
@@ -720,9 +727,11 @@ class Reduction(Unit):
             xs = make_least_common_shape(xs=xs, ignore_ranks=(self.arg,))
 
         if self.reduction == 'collapse':
-            assert all(axis == n for n, axis in enumerate(self.axis, self.axis[0]))
+            start = self.axis[0]
+            end = self.axis[-1] + 1
+            assert all(axis == n for n, axis in enumerate(self.axis, start))
             reduced_shape = shape(x)
-            reduced_shape = reduced_shape[:self.axis[0]] + (product(reduced_shape[self.axis[0]:self.axis[-1]]),) + reduced_shape[self.axis[-1]:]
+            reduced_shape = reduced_shape[:start] + (product(reduced_shape[start:end]),) + reduced_shape[end:]
             return tf.reshape(tensor=x, shape=reduced_shape)
 
         elif self.reduction == 'concat':
