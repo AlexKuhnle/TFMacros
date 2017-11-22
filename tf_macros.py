@@ -84,27 +84,29 @@ class Model(object):
         else:
             return dtype
 
-    def __init__(self, name=None, optimizer='adam', learning_rate=0.001, weight_decay=0.0, clip_gradients=1.0, model_file=None, summary_file=None):
+    def __init__(self, name=None, optimizer='adam', learning_rate=0.001, weight_decay=0.0, clip_gradients=1.0, model_directory=None, summary_directory=None):
         assert name is None or isinstance(name, str)
         assert optimizer in ('adam',)
         assert isinstance(learning_rate, float)
         assert isinstance(weight_decay, float)
         assert isinstance(clip_gradients, float)
-        assert model_file is None or isinstance(model_file, str)
-        assert summary_file is None or isinstance(summary_file, str)
+        assert model_directory is None or isinstance(model_directory, str)
+        assert summary_directory is None or isinstance(summary_directory, str)
         self.name = name
         self.optimizer = optimizer
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.clip_gradients = clip_gradients
-        self.model_file = model_file
-        self.summary_file = summary_file
+        self.model_directory = model_directory
+        self.summary_directory = summary_directory
         self.tensors = dict()
         self.variables = dict()
         self.placeholders = dict()
         self.num_parameters = 0
         self.num_bytes = 0
+        self.scope = None
         self.session = None
+        self.coordinator = None
         self.defined = False
 
     def __str__(self):
@@ -142,11 +144,20 @@ class Model(object):
 
     def __exit__(self, type, value, tb):
         if type is not None:
+            if self.scope is not None:
+                self.scope.__exit__(None, None, None)
+            if self.coordinator is not None:
+                self.coordinator.request_stop()
+                self.coordinator.join(threads=self.queue_threads)
+            if self.session is not None:
+                self.session.close()
+            Model.current = None
             raise
         if self.defined:
             self.coordinator.request_stop()
             self.coordinator.join(threads=self.queue_threads)
             self.save()
+            self.session.close()
         else:
             for name, variable in self.variables.items():
                 regularization = self.weight_decay * tf.nn.l2_loss(t=variable, name=(name + '-regularization'))
@@ -175,32 +186,34 @@ class Model(object):
         grads_and_vars = [(tf.clip_by_value(t=grad, clip_value_min=-self.clip_gradients, clip_value_max=self.clip_gradients), var) for grad, var in grads_and_vars]
         self.optimization = optimizer.apply_gradients(grads_and_vars=grads_and_vars)
         global_variables_initializer = tf.global_variables_initializer()
-        if self.model_file is not None:
+        if self.model_directory is not None:
             self.saver = tf.train.Saver()
-        if self.summary_file is not None:
+        if self.summary_directory is not None:
             tf.summary.scalar(name='loss', tensor=loss)
             for variable in tf.trainable_variables():
                 tf.summary.histogram(name=variable.name, values=variable)
             self.summaries = tf.summary.merge_all()
         self.scope.__exit__(None, None, None)
+        self.scope = None
         tf.get_default_graph().finalize()
         self.defined = True
 
         self.session = tf.Session()
         if restore:
-            assert self.model_file
-            self.saver.restore(sess=self.session, save_path=self.model_file)
+            assert self.model_directory
+            # save_path = tf.train.latest_checkpoint(checkpoint_dir=self.model_directory)
+            self.saver.restore(sess=self.session, save_path=(self.model_directory + 'model'))
         else:
             self.session.run(fetches=global_variables_initializer)
-        if self.summary_file is not None:
-            self.summary_writer = tf.summary.FileWriter(logdir=self.summary_file, graph=self.session.graph)
+        if self.summary_directory is not None:
+            self.summary_writer = tf.summary.FileWriter(logdir=self.summary_directory, graph=self.session.graph)
         self.coordinator = tf.train.Coordinator()
         self.queue_threads = tf.train.start_queue_runners(sess=self.session, coord=self.coordinator)
 
     def save(self):
         assert self.defined
-        if self.model_file:
-            self.saver.save(sess=self.session, save_path=self.model_file)
+        if self.model_directory:
+            self.saver.save(sess=self.session, save_path=(self.model_directory + 'model'))
 
     def __call__(self, query=None, data=None, optimize=True, summarize=True, dropout=0.0):
         assert self.session
@@ -213,23 +226,22 @@ class Model(object):
         if optimize:
             assert 'optimization' not in fetches
             fetches['optimization'] = self.optimization
-        if self.summary_file is not None and summarize:
+        if self.summary_directory is not None and summarize:
             assert 'summaries' not in fetches
             fetches['summaries'] = self.summaries
         if data is None:
-            feed_dict = None
+            feed_dict = dict()
         elif isinstance(data, dict):
             feed_dict = {self.placeholders[name]: value for name, value in data.items() if name in self.placeholders}
         else:
             assert len(self.placeholders) == 1
             feed_dict = {next(iter(self.placeholders.values())): data}
-        if dropout > 0.0:
-            assert dropout < 1.0
-            feed_dict[self.dropout] = dropout
+        assert 0.0 <= dropout < 1.0
+        feed_dict[self.dropout] = dropout
         fetched = self.session.run(fetches=fetches, feed_dict=feed_dict)
         if optimize:
             fetched.pop('optimization')
-        if self.summary_file is not None and summarize:
+        if self.summary_directory is not None and summarize:
             fetched.pop('summaries')
         return fetched
 
@@ -378,6 +390,7 @@ class Variable(Unit):
             assert self.shape == shape
 
     def forward(self):
+        # TODO: own instead of tf.contrib.layers.variance_scaling_initializer, and with min(?, 0.01)
         assert self.shape is not None
         if self.init == 'zeros':
             initializer = tf.zeros_initializer(dtype=self.dtype)
@@ -443,11 +456,13 @@ class Binary(Input):
     def forward(self, x):
         correct = y = super(Binary, self).forward()
         if self.soft > 0.0:
-            noise = tf.random_uniform(shape=(1, 1), minval=0.0, maxval=self.soft)
-            correct = tf.abs(x=(correct - noise))
+            noise = tf.random_uniform(shape=tf.shape(input=correct), minval=0.0, maxval=self.soft)
+            soft_correct = tf.abs(x=(correct - noise))
+        else:
+            soft_correct = correct
         x >>= Linear(size=0)
         x = (tf.tanh(x=x) + 1.0) / 2.0
-        cross_entropy = -(correct * tf.log(x=x + 1e-10) + (1.0 - correct) * tf.log(x=1.0 - x + 1e-10))
+        cross_entropy = -(soft_correct * tf.log(x=x + 1e-10) + (1.0 - soft_correct) * tf.log(x=1.0 - x + 1e-10))
         loss = tf.reduce_mean(input_tensor=cross_entropy)
         tf.losses.add_loss(loss=loss)
         prediction = tf.cast(x=tf.greater(x=x, y=tf.constant(value=0.5)), dtype=Model.dtype('float'))
@@ -474,12 +489,14 @@ class Classification(Input):
             correct = tf.one_hot(indices=correct, depth=self.num_classes)
         if self.soft > 0.0:
             noise = tf.random_uniform(shape=(1, shape(correct)[1]), minval=0.0, maxval=self.soft)
-            correct = tf.abs(x=(correct - noise))
+            soft_correct = tf.abs(x=(correct - noise))
+        else:
+            soft_correct = correct
         x >>= Linear(size=self.num_classes)
         if self.multi_class:
-            tf.losses.sigmoid_cross_entropy(multi_class_labels=correct, logits=x)
+            tf.losses.sigmoid_cross_entropy(multi_class_labels=soft_correct, logits=x)
         else:
-            tf.losses.softmax_cross_entropy(onehot_labels=correct, logits=x)
+            tf.losses.softmax_cross_entropy(onehot_labels=soft_correct, logits=x)
         prediction = tf.one_hot(indices=tf.argmax(input=x, axis=1), depth=self.num_classes)
         relevant = tf.reduce_sum(input_tensor=correct, axis=1)
         selected = tf.reduce_sum(input_tensor=prediction, axis=1)
@@ -588,8 +605,7 @@ class Dropout(Unit):
         super(Dropout, self).__init__(name=name)
 
     def forward(self, x):
-        assert Model.current.dropout
-        return tf.nn.dropout(x=x, keep_prob=(1.0 - Model.current.dropout))
+        return tf.nn.dropout(x=x, keep_prob=(1.0 - tf.Print(Model.current.dropout, (Model.current.dropout,))))
 
 
 class Normalization(Unit):
@@ -1040,13 +1056,13 @@ class Linear(Layer):
 
 class Dense(Layer):
 
-    def __init__(self, size, bias=False, normalization=True, activation='tanh', gated=False, norm_act_before=False, dropout=False, name=None):
+    def __init__(self, size, bias=True, normalization=True, activation='tanh', gated=False, norm_act_before=False, dropout=False, name=None):
         assert isinstance(bias, bool)
         assert isinstance(normalization, bool)
         assert not activation or Activation.valid(activation)
         assert isinstance(gated, bool)
         assert isinstance(norm_act_before, bool)
-        assert not dropout or Dropout.valid(dropout)
+        assert isinstance(dropout, bool)
         if size == 0:
             size = 1
             self.squeeze = True
