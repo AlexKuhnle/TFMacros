@@ -405,6 +405,21 @@ class Composed(Unit):
         return Composed(first=self, second=other)
 
 
+def customize(unit_, **specified):
+
+    class CustomUnit(unit_):
+
+        def __init__(self, **kwargs):
+            assert all(arg not in kwargs for arg in specified)
+            kwargs.update(specified)
+            if kwargs.get('name') is None:
+                kwargs['name'] = unit_.__name__ + str(unit_.index)
+                unit_.index += 1
+            super(CustomUnit, self).__init__(**kwargs)
+
+    return CustomUnit
+
+
 class Layer(Unit):
 
     num_in = 1
@@ -427,15 +442,15 @@ class LayerStack(Unit):
     num_in = 1
     num_out = 1
 
-    def initialize(self, x):
-        super(LayerStack, self).initialize(x)
+    def initialize(self, *xs):
+        super(LayerStack, self).initialize(*xs)
         self.layers = list()
 
-    def forward(self, x):
-        super(LayerStack, self).forward(x)
+    def forward(self, *xs):
+        super(LayerStack, self).forward(*xs)
         for layer in self.layers:
-            x >>= layer
-        return x
+            xs >>= layer
+        return xs
 
 
 class Variable(Unit):
@@ -486,10 +501,10 @@ class Variable(Unit):
             initializer = tf.contrib.layers.variance_scaling_initializer(factor=1.0, mode='FAN_AVG', dtype=self.dtype)
         else:
             assert False
-        variable = tf.get_variable(name=self.name, shape=self.shape, dtype=self.dtype, initializer=initializer)
+        variable = tf.get_variable(name=str(self), shape=self.shape, dtype=self.dtype, initializer=initializer)
         num_parameters = product(self.shape)
         num_bytes = num_parameters * self.dtype_bytes
-        Model.current.register_variable(key='{}/{}'.format(tf.get_variable_scope().name, self.name), variable=variable, num_parameters=num_parameters, num_bytes=num_bytes)
+        Model.current.register_variable(key='{}/{}'.format(tf.get_variable_scope().name, str(self)), variable=variable, num_parameters=num_parameters, num_bytes=num_bytes)
         return tf.identity(input=variable)
 
 
@@ -547,8 +562,8 @@ class Input(Unit):
     def forward(self):
         super(Input, self).forward()
         if self.tensor is None:
-            placeholder = tf.placeholder(dtype=self.dtype, shape=self.shape, name=self.name)
-            Model.current.register_placeholder(key=self.name, placeholder=placeholder)
+            placeholder = tf.placeholder(dtype=self.dtype, shape=self.shape, name=str(self))
+            Model.current.register_placeholder(key=str(self), placeholder=placeholder)
             self.tensor = tf.identity(input=placeholder)
         return self.tensor
 
@@ -568,7 +583,7 @@ class Output(Unit):
 
     def initialize(self, x):
         super(Output, self).initialize(x)
-        self.input = Input(name=self.name, shape=self.shape, dtype=self.dtype, batched=self.batched, tensor=self.tensor)
+        self.input = Input(name=str(self), shape=self.shape, dtype=self.dtype, batched=self.batched, tensor=self.tensor)
 
 
 class Binary(Output):
@@ -598,7 +613,7 @@ class Binary(Output):
         prediction = tf.cast(x=tf.greater(x=x, y=tf.constant(value=0.5)), dtype=Model.dtype('float'))
         num_correct = tf.cast(x=tf.equal(x=prediction, y=correct), dtype=Model.dtype('float'))
         accuracy = tf.reduce_mean(input_tensor=num_correct)
-        Model.current.register_tensor(key=(self.name + '_accuracy'), tensor=accuracy)
+        Model.current.register_tensor(key=(str(self) + '_accuracy'), tensor=accuracy)
         return correct, prediction
 
 
@@ -644,9 +659,9 @@ class Classification(Output):
         precision = tf.reduce_mean(input_tensor=tf.divide(x=true_positive, y=selected), axis=0)
         recall = tf.reduce_mean(input_tensor=tf.divide(x=true_positive, y=relevant), axis=0)
         fscore = (2 * precision * recall) / (precision + recall)
-        Model.current.register_tensor(key=(self.name + '_precision'), tensor=precision)
-        Model.current.register_tensor(key=(self.name + '_recall'), tensor=recall)
-        Model.current.register_tensor(key=(self.name + '_fscore'), tensor=fscore)
+        Model.current.register_tensor(key=(str(self) + '_precision'), tensor=precision)
+        Model.current.register_tensor(key=(str(self) + '_recall'), tensor=recall)
+        Model.current.register_tensor(key=(str(self) + '_fscore'), tensor=fscore)
         return correct, prediction
 
 
@@ -1713,7 +1728,9 @@ class Repeat(LayerStack):
 
     def __init__(self, layer, sizes, name=None, **kwargs):
         super(Repeat, self).__init__(name=name)
-        # assert issubclass(self.layer, Layer)
+        assert issubclass(layer, Layer)
+        self.num_in = layer.num_in
+        self.num_out = layer.num_out
         self.layer = layer
         self.sizes = sizes
         self.kwargs = kwargs
@@ -1724,8 +1741,8 @@ class Repeat(LayerStack):
     #     else:
     #         return super(Repeat, self).__str__()
 
-    def initialize(self, x):
-        super(Repeat, self).initialize(x)
+    def initialize(self, *xs):
+        super(Repeat, self).initialize(*xs)
         kwargs_list = [dict(size=size) for n, size in enumerate(self.sizes)]
         for name, value in self.kwargs.items():
             if isinstance(value, list):
