@@ -110,6 +110,7 @@ class Model(object):
         self.session = None
         self.coordinator = None
         self.defined = False
+        self.optimization = None
 
     def __str__(self):
         if self.name is None:
@@ -171,10 +172,17 @@ class Model(object):
             self.tensors['loss'] = loss
             if self.optimizer == 'adam':
                 optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
-            grads_and_vars = optimizer.compute_gradients(loss=loss)
-            if self.clip_gradients is not None:
-                grads_and_vars = [(tf.clip_by_value(t=grad, clip_value_min=-self.clip_gradients, clip_value_max=self.clip_gradients), var) for grad, var in grads_and_vars]
-            self.optimization = optimizer.apply_gradients(grads_and_vars=grads_and_vars)
+            try:
+                grads_and_vars = optimizer.compute_gradients(loss=loss)
+                if self.clip_gradients is not None:
+                    grads_and_vars = [(tf.clip_by_value(t=grad, clip_value_min=-self.clip_gradients, clip_value_max=self.clip_gradients), var) for grad, var in grads_and_vars]
+                self.optimization = optimizer.apply_gradients(grads_and_vars=grads_and_vars)
+            except ValueError as exc:
+                if str(exc) == 'No variables to optimize.':
+                    if self.optimization is None:
+                        self.optimization = tf.no_op()
+                else:
+                    raise exc
             self.scope.__exit__(type, value, tb)
         assert Model.current is not None
         Model.current = None
@@ -189,10 +197,17 @@ class Model(object):
         self.tensors['loss'] = loss
         if self.optimizer == 'adam':
             optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
-        grads_and_vars = optimizer.compute_gradients(loss=loss)
-        if self.clip_gradients is not None:
-            grads_and_vars = [(tf.clip_by_value(t=grad, clip_value_min=-self.clip_gradients, clip_value_max=self.clip_gradients), var) for grad, var in grads_and_vars]
-        self.optimization = optimizer.apply_gradients(grads_and_vars=grads_and_vars)
+        try:
+            grads_and_vars = optimizer.compute_gradients(loss=loss)
+            if self.clip_gradients is not None:
+                grads_and_vars = [(tf.clip_by_value(t=grad, clip_value_min=-self.clip_gradients, clip_value_max=self.clip_gradients), var) for grad, var in grads_and_vars]
+            self.optimization = optimizer.apply_gradients(grads_and_vars=grads_and_vars)
+        except ValueError as exc:
+            if str(exc) == 'No variables to optimize.':
+                if self.optimization is None:
+                    self.optimization = tf.no_op()
+            else:
+                raise exc
         global_variables_initializer = tf.global_variables_initializer()
         if self.model_directory is not None:
             self.saver = tf.train.Saver()
@@ -223,7 +238,7 @@ class Model(object):
         if self.model_directory:
             self.saver.save(sess=self.session, save_path=(self.model_directory + 'model'))
 
-    def __call__(self, query=None, data=None, optimize=True, summarize=True, dropout=None):
+    def __call__(self, query=None, data=None, optimize=False, summarize=False, dropout=None):
         assert self.session
         if query is None:
             fetches = dict()
@@ -588,9 +603,11 @@ class Output(Unit):
 
 class Binary(Output):
 
-    def __init__(self, name, soft=0.0, tensor=None):
+    def __init__(self, name, binary_transform=True, soft=0.0, tensor=None):
         super(Binary, self).__init__(name=name, shape=(), tensor=tensor)
+        assert isinstance(binary_transform, bool)
         assert isinstance(soft, float) and 0.0 <= soft < 0.5
+        self.binary_transform = binary_transform
         self.soft = soft
 
     def initialize(self, x):
@@ -605,9 +622,10 @@ class Binary(Output):
             soft_correct = tf.abs(x=(correct - noise))
         else:
             soft_correct = correct
-        x >>= self.linear
-        x = (tf.tanh(x=x) + 1.0) / 2.0
-        cross_entropy = -(soft_correct * tf.log(x=x + 1e-10) + (1.0 - soft_correct) * tf.log(x=1.0 - x + 1e-10))
+        if self.binary_transform:
+            x >>= self.linear
+            x = (tf.tanh(x=x) + 1.0) / 2.0
+        cross_entropy = -(soft_correct * tf.log(x=tf.maximum(x=x, y=1e-8)) + (1.0 - soft_correct) * tf.log(x=tf.maximum(x=(1.0 - x), y=1e-8)))
         loss = tf.reduce_mean(input_tensor=cross_entropy)
         tf.losses.add_loss(loss=loss)
         prediction = tf.cast(x=tf.greater(x=x, y=tf.constant(value=0.5)), dtype=Model.dtype('float'))
@@ -712,6 +730,24 @@ class Print(Unit):
         else:
             message = self.prefix + ': '
         return (tf.Print(input_=xs[0], data=xs, message=message, first_n=self.times, summarize=self.size),) + tuple(xs[1:])
+
+
+class Constant(Unit):
+
+    num_in = 1
+    num_out = 1
+
+    def __init__(self, value, dtype, name=None):
+        super(Constant, self).__init__(name=name)
+        self.value = value
+        self.dtype = dtype
+
+    def forward(self, x):
+        super(Constant, self).forward(x)
+        batch_size = tf.shape(input=x)[0]
+        x = tf.constant(value=self.value, dtype=Model.dtype(self.dtype))
+        multiples = (batch_size,) + tuple(1 for _ in range(rank(x)))
+        return tf.tile(input=tf.expand_dims(input=x, axis=0), multiples=multiples)
 
 
 class Select(Unit):
