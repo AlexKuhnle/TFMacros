@@ -420,6 +420,7 @@ class Composed(Unit):
         return Composed(first=self, second=other)
 
 
+# Create a custom class with some arguments specified
 def customize(unit_, **specified):
 
     class CustomUnit(unit_):
@@ -525,7 +526,7 @@ class Variable(Unit):
 
 class Linear(Layer):
 
-    def __init__(self, size, bias=False, name=None):
+    def __init__(self, size, bias=True, name=None):
         super(Linear, self).__init__(size=size, name=name)
         assert isinstance(bias, bool)
         self.weights = None
@@ -550,7 +551,7 @@ class Linear(Layer):
             x = tf.nn.conv1d(value=x, filters=self.weights(), stride=1, padding='SAME')
         elif rank(x) == 4:
             x = tf.nn.conv2d(input=x, filter=self.weights(), strides=(1, 1, 1, 1), padding='SAME')
-        if self.bias:
+        if self.bias is not None:
             x = tf.nn.bias_add(value=x, bias=self.bias())
         if self.squeeze:
             x = tf.squeeze(input=x, axis=-1)
@@ -818,7 +819,7 @@ class Normalization(Unit):
     def valid(normalization):
         return normalization in ('instance', 'batch', 'global')
 
-    def __init__(self, normalization, scale=False, offset=False, variance_epsilon=1e-6, name=None):
+    def __init__(self, normalization, scale=True, offset=True, variance_epsilon=1e-6, name=None):
         super(Normalization, self).__init__(name=name)
         assert Normalization.valid(normalization)
         assert isinstance(scale, bool)
@@ -832,7 +833,7 @@ class Normalization(Unit):
     def initialize(self, x):
         super(Normalization, self).initialize(x)
         if self.normalization != 'instance':
-            self.exp_moving_average = tf.train.ExponentialMovingAverage(decay=0.5, num_updates=None)
+            self.exp_moving_average = tf.train.ExponentialMovingAverage(decay=0.9, num_updates=None)
         mean_shape = tuple(1 for _ in range(rank(x) - 1)) + (shape(x)[-1],)
         if self.scale:
             self.scale = Variable(name='scale', shape=mean_shape, init='zeros')
@@ -907,16 +908,18 @@ class FiLM(Unit):
     num_in = 2
     num_out = 1
 
-    def __init__(self, layer, scale=Linear, offset=Linear, activation='relu', dropout=False, norm_act_film_before=False, name=None, **kwargs):
+    def __init__(self, layer, scale=Linear, offset=Linear, normalization='instance', activation='relu', dropout=False, norm_act_film_before=False, name=None, **kwargs):
         super(FiLM, self).__init__(name=name)
         assert issubclass(layer, Layer)
         assert issubclass(scale, Layer) and issubclass(offset, Layer)
-        assert activation is None or Activation.valid(activation)
+        assert not normalization or Normalization.valid(normalization)
+        assert not activation or Activation.valid(activation)
         assert isinstance(dropout, bool)
         assert isinstance(norm_act_film_before, bool)
         self.layer = layer
         self.scale = scale
         self.offset = offset
+        self.normalization = normalization
         self.activation = activation
         self.dropout = dropout
         self.norm_act_film_before = norm_act_film_before
@@ -926,12 +929,15 @@ class FiLM(Unit):
         super(FiLM, self).initialize(x, condition)
         self.layer = self.layer(normalization=False, activation=None, dropout=False, **self.kwargs)
         self.film = FeaturewiseLinearModulation(offset=self.offset, scale=self.scale)
+        self.normalization = Normalization(normalization=self.normalization, scale=False, offset=False) if self.normalization else None
         self.activation = Activation(activation=self.activation) if self.activation else None
         self.dropout = Dropout() if self.dropout else None
 
     def forward(self, x, condition):
         super(FiLM, self).forward(x, condition)
         if self.norm_act_film_before:
+            if self.normalization is not None:
+                x >>= self.normalization
             x = (x, condition) >> self.film
             if self.activation is not None:
                 x >>= self.activation
@@ -939,6 +945,8 @@ class FiLM(Unit):
                 x >>= self.dropout
         x >>= self.layer
         if not self.norm_act_film_before:
+            if self.normalization is not None:
+                x >>= self.normalization
             x = (x, condition) >> self.film
             if self.activation is not None:
                 x >>= self.activation
@@ -1531,7 +1539,7 @@ class Convolution(Layer):
             x = tf.nn.conv2d_transpose(value=x, filter=self.filters(), output_shape=(batch, height * self.stride[1], width * self.stride[2], self.size), strides=((1,) + self.stride + (1,)), padding=self.padding)
         else:
             x = tf.nn.conv2d(input=x, filter=self.filters(), strides=((1,) + self.stride + (1,)), padding=self.padding)
-        if self.bias:
+        if self.bias is not None:
             x = tf.nn.bias_add(value=x, bias=self.bias())
         if self.squeeze:
             x = tf.squeeze(input=x, axis=-1)
@@ -1673,54 +1681,96 @@ class NgramConvolution(Layer):
         return tf.concat(values=embeddings, axis=1)
 
 
-class Lstm(Layer):
+class RnnCell(Layer):
+
+    # variables not registered !!!
+
+    # CellWrapper???
+    #   def _rnn_get_variable(self, getter, *args, **kwargs):
+    #     variable = getter(*args, **kwargs)
+    #     if context.in_graph_mode():
+    #       trainable = (variable in tf_variables.trainable_variables() or
+    #                    (isinstance(variable, tf_variables.PartitionedVariable) and
+    #                     list(variable)[0] in tf_variables.trainable_variables()))
+    #     else:
+    #       trainable = variable._trainable  # pylint: disable=protected-access
+    #     if trainable and variable not in self._trainable_weights:
+    #       self._trainable_weights.append(variable)
+    #     elif not trainable and variable not in self._non_trainable_weights:
+    #       self._non_trainable_weights.append(variable)
+    #     return variable
+
+    def __init__(self, size, initial_state_shape=None, initial_state_variable=False, name=None):
+        super(RnnCell, self).__init__(size=size, name=name)
+        assert not self.squeeze
+        self.initial_state_shape = (1, self.size) if initial_state_shape is None else (1,) + initial_state_shape
+        self.initial_state_variable = initial_state_variable
+
+    def initialize(self, x, cell):
+        super(RnnCell, self).initialize(x)
+        self.cell = cell
+        if self.initial_state_variable:
+            self.initial_state = Variable(name='init', shape=self.initial_state_shape, dtype='float')
+        else:
+            self.initial_state = tf.zeros(shape=self.initial_state_shape, dtype=Model.dtype('float'))
+
+    def get_cell(self):
+        return self.cell
+
+    def get_initial_state(self, batch_size):
+        if self.initial_state_variable:
+            initial_state = self.initial_state()
+        else:
+            initial_state = self.initial_state
+        multiples = tuple(batch_size if n == 0 else 1 for n in range(len(self.initial_state_shape)))
+        return tf.tile(input=initial_state, multiples=multiples)
+
+    def get_final_state(self, state):
+        return state
+
+    def forward(self, x, state):
+        super(RnnCell, self).forward(x, state)
+        return self.lstm(inputs=x, state=state)
+
+
+class SimpleRnn(RnnCell):
+
+    def __init__(self, size, layer, initial_state_shape=None, initial_state_variable=False, name=None):
+        super(SimpleRnn, self).__init__(size=size, name=name)
+        # ?????
+        # assert not self.squeeze
+        # self.initial_state_shape = (1, self.size) if self.initial_state_shape is None else (1,) + self.initial_state_shape
+        # self.initial_state_variable = initial_state_variable
+
+
+class Lstm(RnnCell):
 
     num_in = 2
     num_out = 2
-
-    # variables not registered !!!
 
     def __init__(self, size, initial_state_variable=False, name=None):
-        super(Lstm, self).__init__(size=size, name=name)
-        assert not self.squeeze
-        self.initial_state = Variable(name='init', shape=(1, 2, size), dtype='float') if initial_state_variable else None
+        super(Lstm, self).__init__(size=size, initial_state_shape=(2, size), initial_state_variable=initial_state_variable, name=name)
 
-    def forward(self, x=None, state=None):
-        super(Lstm, self).forward(x, state)
-        lstm = tf.contrib.rnn.LSTMCell(num_units=self.size)  # state_is_tuple=False)
-        if x is None:
-            if self.initial_state is None:
-                return lstm, lstm.zero_state(batch_size=1, dtype=Model.dtype('float'))
-            else:
-                initial_state = lambda t: tf.contrib.rnn.LSTMStateTuple(*tf.unstack(value=tf.tile(input=self.initial_state(), multiples=(tf.shape(input=t)[0], 1, 1)), axis=1))
-                return lstm, initial_state
-                # return lstm, self.initial_state()  # tf.contrib.rnn.LSTMStateTuple(c=initial_state[0], h=initial_state[1])
-        else:
-            return lstm(inputs=x, state=state)
+    def initialize(self, x):
+        lstm = tf.contrib.rnn.LSTMCell(num_units=self.size)
+        super(Lstm, self).initialize(x, lstm)
+
+    def get_initial_state(self, batch_size):
+        initial_state = super(Lstm, self).get_initial_state(batch_size=batch_size)
+        return tf.contrib.rnn.LSTMStateTuple(*tf.unstack(value=initial_state, axis=1))
+
+    def get_final_state(self, state):
+        return tf.concat(values=(state.c, state.h), axis=1)
 
 
-class Gru(Layer):
+class Gru(RnnCell):
 
     num_in = 2
     num_out = 2
 
-    # variables not registered !!!
-
-    def __init__(self, size, initial_state_variable=True, name=None):
-        super(Gru, self).__init__(size=size, name=name)
-        assert not self.squeeze
-        self.initial_state = Variable(name='init', shape=(1, size), dtype='float') if initial_state_variable else None
-
-    def forward(self, x=None, state=None):
-        super(Gru, self).forward(x, state)
+    def initialize(self, x):
         gru = tf.contrib.rnn.GRUCell(num_units=self.size)
-        if x is None:
-            if self.initial_state is None:
-                return gru, gru.zero_state(batch_size=1, dtype=Model.dtype('float'))
-            else:
-                return gru, self.initial_state()  # tf.contrib.rnn.LSTMStateTuple(c=initial_state[0], h=initial_state[1])
-        else:
-            return gru(inputs=x, state=state)
+        super(Gru, self).initialize(x, gru)
 
 
 class Rnn(Layer):
@@ -1728,23 +1778,29 @@ class Rnn(Layer):
     num_in = 2
     num_out = 2
 
-    def __init__(self, size, unit=Lstm, initial_state_variable=True, name=None):
+    def __init__(self, size, cell=Lstm, initial_state_variable=False, name=None):
         super(Rnn, self).__init__(size=size, name=name)
         assert not self.squeeze
-        assert issubclass(unit, Layer)
+        assert issubclass(cell, RnnCell)
         assert isinstance(initial_state_variable, bool)
-        self.unit = unit(size=size, initial_state_variable=initial_state_variable)
+        self.cell = cell
+        self.initial_state_variable = initial_state_variable
+
+    def initialize(self, x, length=None):
+        super(Rnn, self).initialize(x, length)
+        self.cell = self.cell(size=self.size, initial_state_variable=self.initial_state_variable)
+        self.cell.initialize(x=x)
 
     def forward(self, x, length=None):
         super(Rnn, self).forward(x, length)
         if length is not None and rank(length) == 2:
-            # asserts
             length = tf.squeeze(input=length, axis=1)
-        unit, initial_state = self.unit()
-        # initial_state = tf.tile(input=initial_state, multiples=(tf.shape(input=x)[0], 1))
-        initial_state = initial_state(x)
-        x, state = tf.nn.dynamic_rnn(cell=unit, inputs=x, sequence_length=length, dtype=Model.dtype('float'))  # initial_state=initial_state)
-        return x, tf.stack(values=(state.c, state.h), axis=1)
+        cell = self.cell.get_cell()
+        batch_size = tf.shape(input=x)[0]
+        initial_state = self.cell.get_initial_state(batch_size=batch_size)
+        x, state = tf.nn.dynamic_rnn(cell=cell, inputs=x, sequence_length=length, initial_state=initial_state, dtype=Model.dtype('float'))
+        state = self.cell.get_final_state(state=state)
+        return x, state
 
 
 # class Expand(Layer):
@@ -1812,10 +1868,11 @@ class ConvolutionalNet(LayerStack):
 
 class Residual(Layer):
 
-    def __init__(self, size, unit=Convolution, depth=2, reduction='sum', name=None):
+    def __init__(self, size, unit=Convolution, depth=2, transform=True, reduction='sum', name=None):
         super(Residual, self).__init__(size=size, name=name)
         assert isinstance(depth, int) and depth > 0
         assert not self.squeeze or depth == 1
+        assert isinstance(transform, (bool, Layer))
         self.unit = unit
         self.depth = depth
         self.reduction = reduction
@@ -1825,10 +1882,12 @@ class Residual(Layer):
         self.units = list()
         for _ in range(self.depth):
             self.units.append(self.unit(size=self.size))
-        if shape(x)[-1] != self.size:
-            self.transform = self.unit(size=self.size)
-        else:
+        if shape(x)[-1] == self.size:
             self.transform = None
+        elif isinstance(self.transform, Layer):
+            self.transform = self.transform(size=self.size)
+        else:
+            self.transform = self.unit(size=self.size)
         self.reduction = Reduction(reduction=self.reduction)
 
     def forward(self, x):
