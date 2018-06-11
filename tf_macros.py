@@ -1683,6 +1683,21 @@ class NgramConvolution(Layer):
 
 class RnnCell(Layer):
 
+    @staticmethod
+    def valid(cell):
+        return cell in ('gru', 'lstm', 'simple')
+
+    @staticmethod
+    def from_name(cell):
+        if cell == 'gru':
+            return Gru
+        elif cell == 'lstm':
+            return Lstm
+        elif cell == 'simple':
+            return SimpleRnn
+        else:
+            raise Exception()
+
     # variables not registered !!!
 
     # CellWrapper???
@@ -1699,6 +1714,10 @@ class RnnCell(Layer):
     #     elif not trainable and variable not in self._non_trainable_weights:
     #       self._non_trainable_weights.append(variable)
     #     return variable
+
+    @classmethod
+    def size_from_state_size(state_size):
+        return state_size
 
     def __init__(self, size, initial_state_shape=None, initial_state_variable=False, name=None):
         super(RnnCell, self).__init__(size=size, name=name)
@@ -1748,6 +1767,11 @@ class Lstm(RnnCell):
     num_in = 2
     num_out = 2
 
+    @classmethod
+    def size_from_state_size(state_size):
+        assert state_size % 2 == 0
+        return state_size // 2
+
     def __init__(self, size, initial_state_variable=False, name=None):
         super(Lstm, self).__init__(size=size, initial_state_shape=(2, size), initial_state_variable=initial_state_variable, name=name)
 
@@ -1778,7 +1802,12 @@ class Rnn(Layer):
     num_in = 2
     num_out = 2
 
-    def __init__(self, size, cell=Lstm, initial_state_variable=False, name=None):
+    def __init__(self, size, state_size=None, cell='lstm', initial_state_variable=False, name=None):
+        if RnnCell.valid(cell=cell):
+            cell = RnnCell.from_name(cell=cell)
+        if size is None:
+            assert state_size is not None
+            size = cell.size_from_state_size(state_size=state_size)
         super(Rnn, self).__init__(size=size, name=name)
         assert not self.squeeze
         assert issubclass(cell, RnnCell)
@@ -1875,6 +1904,7 @@ class Residual(Layer):
         assert isinstance(transform, (bool, Layer))
         self.unit = unit
         self.depth = depth
+        self.transform = transform
         self.reduction = reduction
 
     def initialize(self, x):
