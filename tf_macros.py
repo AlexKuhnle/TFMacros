@@ -639,7 +639,7 @@ class Binary(Output):
 class Classification(Output):
 
     def __init__(self, name, num_classes, multi_class=False, soft=0.0, tensor=None):
-        super(Classification, self).__init__(name=name, shape=(num_classes,), tensor=tensor)
+        super(Classification, self).__init__(name=name, shape=(), tensor=tensor)
         assert isinstance(num_classes, int) and num_classes > 0
         assert isinstance(multi_class, bool)
         assert isinstance(soft, float) and 0.0 <= soft < 0.5
@@ -655,6 +655,7 @@ class Classification(Output):
         super(Classification, self).forward(x)
         correct = self.input()
         if not self.multi_class and rank(correct) == 1:
+            correct = tf.cast(correct, tf.int32)
             correct_onehot = tf.one_hot(indices=correct, depth=self.num_classes)
         else:
             correct_onehot = correct
@@ -672,9 +673,9 @@ class Classification(Output):
         prediction_onehot = tf.one_hot(indices=prediction, depth=self.num_classes)
         if self.multi_class or rank(correct) == 2:
             prediction = prediction_onehot
-        relevant = tf.reduce_sum(input_tensor=correct, axis=1)
+        relevant = tf.reduce_sum(input_tensor=correct_onehot, axis=1)
         selected = tf.reduce_sum(input_tensor=prediction_onehot, axis=1)
-        true_positive = tf.reduce_sum(input_tensor=tf.minimum(x=prediction_onehot, y=correct), axis=1)
+        true_positive = tf.reduce_sum(input_tensor=tf.minimum(x=prediction_onehot, y=correct_onehot), axis=1)
         precision = tf.reduce_mean(input_tensor=tf.divide(x=true_positive, y=selected), axis=0)
         recall = tf.reduce_mean(input_tensor=tf.divide(x=true_positive, y=relevant), axis=0)
         fscore = (2 * precision * recall) / (precision + recall)
@@ -807,17 +808,18 @@ class Dropout(Unit):
 
     def forward(self, x):
         super(Dropout, self).forward(x)
-        return tf.nn.dropout(x=x, keep_prob=(1.0 - Model.current.dropout))
+        return tf.nn.dropout(x=x, rate=Model.current.dropout)
 
 
 class Normalization(Unit):
+    # https://arxiv.org/abs/1803.08494
 
     num_in = 1
     num_out = 1
 
     @staticmethod
     def valid(normalization):
-        return normalization in ('instance', 'batch', 'global')
+        return normalization in ('batch', 'group', 'instance', 'layer')
 
     def __init__(self, normalization, scale=True, offset=True, variance_epsilon=1e-6, name=None):
         super(Normalization, self).__init__(name=name)
@@ -829,10 +831,11 @@ class Normalization(Unit):
         self.scale = scale
         self.offset = offset
         self.variance_epsilon = variance_epsilon
+        # hyperparameter 32 for 'group'
 
     def initialize(self, x):
         super(Normalization, self).initialize(x)
-        if self.normalization != 'instance':
+        if self.normalization == 'batch':
             self.exp_moving_average = tf.train.ExponentialMovingAverage(decay=0.9, num_updates=None)
         mean_shape = tuple(1 for _ in range(rank(x) - 1)) + (shape(x)[-1],)
         if self.scale:
@@ -846,12 +849,16 @@ class Normalization(Unit):
 
     def forward(self, x):
         super(Normalization, self).forward(x)
-        if self.normalization == 'instance':
-            mean, variance = tf.nn.moments(x=x, axes=tuple(range(1, rank(x))), keep_dims=True)
-        elif self.normalization == 'batch':
-            mean, variance = tf.nn.moments(x=x, axes=(0,), keep_dims=True)
-        elif self.normalization == 'global':
+        if self.normalization == 'batch':
             mean, variance = tf.nn.moments(x=x, axes=tuple(range(rank(x) - 1)), keep_dims=True)
+        elif self.normalization == 'group':
+            tensor_shape = shape(x)
+            x = tf.reshape(input=x, shape=(tensor_shape[:-1], tensor_shape[-1] // 32, 32))  # hyperparameter!!!
+            mean, variance = tf.nn.moments(x=x, axes=tuple(1, range(rank(x) - 1)), keep_dims=True)
+        elif self.normalization == 'instance':
+            mean, variance = tf.nn.moments(x=x, axes=tuple(range(1, rank(x) - 1)), keep_dims=True)
+        elif self.normalization == 'layer':
+            mean, variance = tf.nn.moments(x=x, axes=tuple(range(1, rank(x))), keep_dims=True)
 
         if self.normalization != 'instance':
 
@@ -873,7 +880,13 @@ class Normalization(Unit):
             offset = None
         else:
             offset = self.offset()
-        return tf.nn.batch_normalization(x=x, mean=mean, variance=variance, offset=offset, scale=scale, variance_epsilon=self.variance_epsilon)
+
+        if self.normalization == 'group':
+            x = tf.nn.batch_normalization(x=x, mean=mean, variance=variance, offset=None, scale=None, variance_epsilon=self.variance_epsilon)
+            x = tf.reshape(input=x, shape=tensor_shape)
+            return x * scale + offset
+        else:
+            return tf.nn.batch_normalization(x=x, mean=mean, variance=variance, offset=offset, scale=scale, variance_epsilon=self.variance_epsilon)
 
 
 class FeaturewiseLinearModulation(Unit):
@@ -1716,7 +1729,7 @@ class RnnCell(Layer):
     #     return variable
 
     @classmethod
-    def size_from_state_size(state_size):
+    def size_from_state_size(cls, state_size):
         return state_size
 
     def __init__(self, size, initial_state_shape=None, initial_state_variable=False, name=None):
@@ -1749,7 +1762,7 @@ class RnnCell(Layer):
 
     def forward(self, x, state):
         super(RnnCell, self).forward(x, state)
-        return self.lstm(inputs=x, state=state)
+        return self.cell(inputs=x, states=state)
 
 
 class SimpleRnn(RnnCell):
@@ -1768,7 +1781,7 @@ class Lstm(RnnCell):
     num_out = 2
 
     @classmethod
-    def size_from_state_size(state_size):
+    def size_from_state_size(cls, state_size):
         assert state_size % 2 == 0
         return state_size // 2
 
@@ -1776,7 +1789,8 @@ class Lstm(RnnCell):
         super(Lstm, self).__init__(size=size, initial_state_shape=(2, size), initial_state_variable=initial_state_variable, name=name)
 
     def initialize(self, x):
-        lstm = tf.contrib.rnn.LSTMCell(num_units=self.size)
+        lstm = tf.keras.layers.LSTMCell(units=self.size)
+        lstm.build(input_shape=x.shape)
         super(Lstm, self).initialize(x, lstm)
 
     def get_initial_state(self, batch_size):
@@ -1793,7 +1807,8 @@ class Gru(RnnCell):
     num_out = 2
 
     def initialize(self, x):
-        gru = tf.contrib.rnn.GRUCell(num_units=self.size)
+        gru = tf.keras.layers.GRUCell(units=self.size)
+        gru.build(input_shape=x.shape)
         super(Gru, self).initialize(x, gru)
 
 
@@ -1817,19 +1832,25 @@ class Rnn(Layer):
 
     def initialize(self, x, length=None):
         super(Rnn, self).initialize(x, length)
+
         self.cell = self.cell(size=self.size, initial_state_variable=self.initial_state_variable)
         self.cell.initialize(x=x)
+        self.rnn = tf.keras.layers.RNN(cell=self.cell.get_cell(), return_sequences=True, return_state=True)
+        self.rnn.build(input_shape=x.shape)
 
     def forward(self, x, length=None):
         super(Rnn, self).forward(x, length)
         if length is not None and rank(length) == 2:
             length = tf.squeeze(input=length, axis=1)
-        cell = self.cell.get_cell()
+        # cell = self.cell.get_cell()
         batch_size = tf.shape(input=x)[0]
         initial_state = self.cell.get_initial_state(batch_size=batch_size)
-        x, state = tf.nn.dynamic_rnn(cell=cell, inputs=x, sequence_length=length, initial_state=initial_state, dtype=Model.dtype('float'))
-        state = self.cell.get_final_state(state=state)
-        return x, state
+        # x, state = tf.nn.dynamic_rnn(cell=cell, inputs=x, sequence_length=length, initial_state=initial_state, dtype=Model.dtype('float'))
+        x = self.rnn(inputs=x, initial_state=initial_state)
+        final_state = tf.concat(values=x[1:], axis=1)
+        x = x[0]
+        # state = self.cell.get_final_state(state=state)
+        return x, final_state
 
 
 # class Expand(Layer):
@@ -1879,20 +1900,22 @@ class Repeat(LayerStack):
 
 class ConvolutionalNet(LayerStack):
 
-    def __init__(self, sizes, depths, pool='max', name=None):
+    def __init__(self, sizes, depths, pool='max', final_pool=False, name=None, **kwargs):
         super(LayerStack, self).__init__(name=name)
         assert Pooling.valid(pool)
         self.sizes = sizes
         self.depths = depths
         self.pool = pool
+        self.final_pool = final_pool
+        self.kwargs = kwargs
 
     def initialize(self, x):
         super(ConvolutionalNet, self).initialize(x)
         for m, (size, depth) in enumerate(zip(self.sizes, self.depths)):
-            if m > 0:
-                self.layers.append(Pooling(pool=self.pool))
             for n in range(depth):
-                self.layers.append(Convolution(size=size))
+                self.layers.append(Convolution(size=size, **self.kwargs))
+            if m < len(self.sizes) - 1 or self.final_pool:
+                self.layers.append(Pooling(pool=self.pool))
 
 
 class Residual(Layer):
